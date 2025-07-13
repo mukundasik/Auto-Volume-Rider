@@ -5,12 +5,14 @@ changelog:Initial release
 
 slider1:0<-24,24,0.1>Input Gain (dB)
 slider2:0<0,3,1{Peak,LUFS Short,LUFS Momentary,RMS}>Mode
-slider3:-30<-60,0,0.1>Range Minimum (dB)
-slider4:-6<-60,0,0.1>Range Maximum (dB)
-slider5:-18<-60,0,0.1>Target Output Volume (dB)
-slider6:0.1<0,5,0.01>Lookahead (sec)
-slider7:10<0.1,1000,0.1>Attack (ms)
-slider8:100<1,5000,1>Release (ms)
+slider3:-30<-60,0,0.1>Target Range Min (dB)
+slider4:-18<-60,0,0.1>Target Range Max (dB)
+slider5:0.1<0,5,0.01>Lookahead (sec)
+slider6:10<0.1,1000,0.1>Attack (ms)
+slider7:100<1,5000,1>Release (ms)
+slider8:0<-24,24,0.1>Output Gain (dB)
+slider9:1<0,1,1{Off,On}>Limiter Enable
+slider10:0<0,1,1{Peak,True Peak}>Limiter Mode
 
 in_pin:left input
 in_pin:right input
@@ -64,18 +66,28 @@ release_coeff = 0.999;
 k_weight_a = 1.53512485958697;
 k_weight_b = 2.69169618940638;
 
+// True Peak Limiter variables
+limiter_buffer_size = 64; // samples for oversampling
+limiter_buffer_L = max_lookahead_samples * 2 + lufs_buffer_size * 2 + lufs_long_size * 2;
+limiter_buffer_R = limiter_buffer_L + limiter_buffer_size;
+limiter_pos = 0;
+limiter_gain = 1.0;
+limiter_envelope = 0.0;
+
 @slider
 input_gain_linear = 10^(slider1/20);
 mode = slider2;
-range_min = slider3;
-range_max = slider4;
-target_output = slider5;
-lookahead_time = slider6;
+target_range_min = slider3;
+target_range_max = slider4;
+lookahead_time = slider5;
 lookahead_samples = min(max_lookahead_samples, lookahead_time * srate);
+output_gain_linear = 10^(slider8/20);
+limiter_enable = slider9;
+limiter_mode = slider10;
 
 // Convert Attack/Release from milliseconds to coefficients
-attack_ms = slider7;
-release_ms = slider8;
+attack_ms = slider6;
+release_ms = slider7;
 attack_coeff = exp(-1000 / (attack_ms * srate));
 release_coeff = exp(-1000 / (release_ms * srate));
 
@@ -83,6 +95,9 @@ release_coeff = exp(-1000 / (release_ms * srate));
 // Apply input gain
 spl0 *= input_gain_linear;
 spl1 *= input_gain_linear;
+
+// Store input level for display
+input_level_display = max(abs(spl0), abs(spl1));
 
 // Write to lookahead buffer
 lookahead_buffer_L[write_pos] = spl0;
@@ -150,21 +165,12 @@ mode == 0 ? (
   current_level = rms_level > 0 ? 20 * log(rms_level) / LOG10 : -96;
 );
 
-// Apply Range Minimum/Maximum as input signal boundaries
-processed_level = current_level;
+// NEW LOGIC: Target Range Window
+// Calculate target level in the middle of the range window
+target_center = (target_range_min + target_range_max) / 2;
 
-// If signal is quieter than Range Minimum - boost to Range Minimum
-processed_level < range_min ? (
-  processed_level = range_min;
-);
-
-// If signal is louder than Range Maximum - reduce to Range Maximum  
-processed_level > range_max ? (
-  processed_level = range_max;
-);
-
-// Now adjust to Target Output Volume
-level_diff = target_output - processed_level;
+// Calculate required gain to bring current level to target center
+level_diff = target_center - current_level;
 target_gain = 10^(level_diff/20);
 
 // Limit gain to reasonable bounds
@@ -180,66 +186,152 @@ target_gain > current_gain ? (
 );
 
 // Apply gain to delayed signal
-spl0 = delayed_L * current_gain;
-spl1 = delayed_R * current_gain;
+processed_L = delayed_L * current_gain;
+processed_R = delayed_R * current_gain;
+
+// Store processed level for display
+processed_level_display = max(abs(processed_L), abs(processed_R));
+
+// Apply output gain
+processed_L *= output_gain_linear;
+processed_R *= output_gain_linear;
+
+// True Peak Limiter
+limiter_enable ? (
+  // Simple limiter implementation
+  limiter_threshold = 0.99; // -0.087 dB
+  
+  limiter_mode == 0 ? (
+    // Peak mode
+    peak_val = max(abs(processed_L), abs(processed_R));
+    peak_val > limiter_threshold ? (
+      reduction = limiter_threshold / peak_val;
+      processed_L *= reduction;
+      processed_R *= reduction;
+    );
+  ) : (
+    // True Peak mode (simplified oversampling)
+    // Store in buffer for basic oversampling simulation
+    limiter_buffer_L[limiter_pos] = processed_L;
+    limiter_buffer_R[limiter_pos] = processed_R;
+    limiter_pos = (limiter_pos + 1) % limiter_buffer_size;
+    
+    // Check for intersample peaks (simplified)
+    interp_L = (processed_L + limiter_buffer_L[(limiter_pos - 1 + limiter_buffer_size) % limiter_buffer_size]) * 0.5;
+    interp_R = (processed_R + limiter_buffer_R[(limiter_pos - 1 + limiter_buffer_size) % limiter_buffer_size]) * 0.5;
+    
+    true_peak = max(max(abs(processed_L), abs(processed_R)), max(abs(interp_L), abs(interp_R)));
+    
+    true_peak > limiter_threshold ? (
+      reduction = limiter_threshold / true_peak;
+      processed_L *= reduction;
+      processed_R *= reduction;
+    );
+  );
+);
+
+// Output
+spl0 = processed_L;
+spl1 = processed_R;
 
 @gfx 640 480
-// Simple graphical interface
-gfx_clear = 0x000000;
+// Clear background
+gfx_clear = 0x202020;
 
+// Title
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
 gfx_x = 10; gfx_y = 10;
 gfx_printf("Auto Volume Rider");
 
-gfx_x = 10; gfx_y = 40;
-gfx_printf("Input Level: %.1f dB", current_level);
+// Status info
+gfx_x = 10; gfx_y = 30;
+gfx_printf("Mode: %s", mode == 0 ? "Peak" : mode == 1 ? "LUFS Short" : mode == 2 ? "LUFS Momentary" : "RMS");
 
-gfx_x = 10; gfx_y = 60;
-gfx_printf("Processed Level: %.1f dB", processed_level);
+gfx_x = 10; gfx_y = 50;
+gfx_printf("Target Range: %.1f to %.1f dB", target_range_min, target_range_max);
 
-gfx_x = 10; gfx_y = 80;
+gfx_x = 10; gfx_y = 70;
 gfx_printf("Current Gain: %.2f (%.1f dB)", current_gain, 20 * log(current_gain) / LOG10);
 
-gfx_x = 10; gfx_y = 100;
-gfx_printf("Target: %.1f dB", target_output);
+gfx_x = 10; gfx_y = 90;
+gfx_printf("Limiter: %s (%s)", limiter_enable ? "ON" : "OFF", limiter_mode ? "True Peak" : "Peak");
 
-gfx_x = 10; gfx_y = 120;
-gfx_printf("Range: %.1f to %.1f dB", range_min, range_max);
+// Vertical meters - positioned in center
+meter_x = 280;
+meter_width = 20;
+meter_height = 300;
+meter_y = 120;
 
-// Labels for indicators
-gfx_x = 10; gfx_y = 135;
-gfx_printf("Input Level:");
-gfx_x = 10; gfx_y = 155;
-gfx_printf("Processed Level:");
+// Convert levels to display values
+input_level_db = input_level_display > 0 ? 20 * log(input_level_display) / LOG10 : -96;
+processed_level_db = processed_level_display > 0 ? 20 * log(processed_level_display) / LOG10 : -96;
 
-// Input level indicator
-gfx_r = 0; gfx_g = 1; gfx_b = 0;
-level_bar_width = (current_level + 60) / 60 * 200;
-level_bar_width = max(0, min(200, level_bar_width));
-gfx_rect(10, 150, level_bar_width, 15);
-
-// Processed level indicator
-gfx_r = 0; gfx_g = 0.8; gfx_b = 1;
-processed_bar_width = (processed_level + 60) / 60 * 200;
-processed_bar_width = max(0, min(200, processed_bar_width));
-gfx_rect(10, 170, processed_bar_width, 15);
-
-// Indicator frames
+// Input Level Meter (White)
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
-gfx_rect(10, 150, 200, 15, 0);
-gfx_rect(10, 170, 200, 15, 0);
+gfx_rect(meter_x, meter_y, meter_width, meter_height, 0); // Frame
 
-// Target mark
-target_pos = (target_output + 60) / 60 * 200;
-target_pos = max(0, min(200, target_pos));
-gfx_r = 1; gfx_g = 0; gfx_b = 0;
-gfx_line(10 + target_pos, 145, 10 + target_pos, 190);
+// Fill based on level (-60dB to 0dB range)
+input_fill_height = ((input_level_db + 60) / 60) * meter_height;
+input_fill_height = max(0, min(meter_height, input_fill_height));
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_rect(meter_x + 1, meter_y + meter_height - input_fill_height, meter_width - 2, input_fill_height);
 
-// Range Min/Max marks
-range_min_pos = (range_min + 60) / 60 * 200;
-range_max_pos = (range_max + 60) / 60 * 200;
-range_min_pos = max(0, min(200, range_min_pos));
-range_max_pos = max(0, min(200, range_max_pos));
+// Label
+gfx_x = meter_x - 10; gfx_y = meter_y + meter_height + 10;
+gfx_printf("Input");
+
+// Processed Level Meter (Green)
+proc_meter_x = meter_x + 40;
+gfx_r = 0; gfx_g = 1; gfx_b = 0;
+gfx_rect(proc_meter_x, meter_y, meter_width, meter_height, 0); // Frame
+
+// Fill based on level
+processed_fill_height = ((processed_level_db + 60) / 60) * meter_height;
+processed_fill_height = max(0, min(meter_height, processed_fill_height));
+gfx_r = 0; gfx_g = 1; gfx_b = 0;
+gfx_rect(proc_meter_x + 1, meter_y + meter_height - processed_fill_height, meter_width - 2, processed_fill_height);
+
+// Label
+gfx_x = proc_meter_x - 15; gfx_y = meter_y + meter_height + 10;
+gfx_printf("Processed");
+
+// Target Range markers on both meters
+target_min_pos = meter_y + meter_height - ((target_range_min + 60) / 60) * meter_height;
+target_max_pos = meter_y + meter_height - ((target_range_max + 60) / 60) * meter_height;
+target_min_pos = max(meter_y, min(meter_y + meter_height, target_min_pos));
+target_max_pos = max(meter_y, min(meter_y + meter_height, target_max_pos));
+
+// Target range markers (Yellow)
 gfx_r = 1; gfx_g = 1; gfx_b = 0;
-gfx_line(10 + range_min_pos, 145, 10 + range_min_pos, 190);
-gfx_line(10 + range_max_pos, 145, 10 + range_max_pos, 190);
+gfx_line(meter_x - 5, target_min_pos, meter_x + meter_width + 5, target_min_pos);
+gfx_line(meter_x - 5, target_max_pos, meter_x + meter_width + 5, target_max_pos);
+gfx_line(proc_meter_x - 5, target_min_pos, proc_meter_x + meter_width + 5, target_min_pos);
+gfx_line(proc_meter_x - 5, target_max_pos, proc_meter_x + meter_width + 5, target_max_pos);
+
+// Target center line (Red)
+target_center_pos = meter_y + meter_height - ((target_center + 60) / 60) * meter_height;
+target_center_pos = max(meter_y, min(meter_y + meter_height, target_center_pos));
+gfx_r = 1; gfx_g = 0; gfx_b = 0;
+gfx_line(meter_x - 5, target_center_pos, proc_meter_x + meter_width + 5, target_center_pos);
+
+// dB Scale
+gfx_r = 0.7; gfx_g = 0.7; gfx_b = 0.7;
+db_marks = (-60, -40, -20, -10, -6, -3, 0);
+i = 0;
+loop(7,
+  db_val = db_marks[i];
+  scale_pos = meter_y + meter_height - ((db_val + 60) / 60) * meter_height;
+  scale_pos = max(meter_y, min(meter_y + meter_height, scale_pos));
+  gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+  gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+  gfx_printf("%.0f", db_val);
+  i += 1;
+);
+
+// Numerical readouts
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_x = 10; gfx_y = 430;
+gfx_printf("Input Level: %.1f dB", input_level_db);
+
+gfx_x = 10; gfx_y = 450;
+gfx_printf("Processed Level: %.1f dB", processed_level_db);
