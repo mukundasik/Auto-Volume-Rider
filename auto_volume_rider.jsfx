@@ -1,0 +1,476 @@
+desc:Auto Volume Rider by Mukundas
+author:Mukundas
+version:1.8.4
+
+slider1:0<-24,24,0.1>Input Gain (dB)
+slider2:0<0,3,1{Peak,LUFS Short,LUFS Momentary,RMS}>Mode
+slider4:20<0.1,1000,0.1>Attack (ms)
+slider5:200<1,5000,1>Release (ms)
+slider6:-30<-60,0,0.1>Target Range Min (dB)
+slider7:-10<-60,0,0.1>Target Range Max (dB)
+slider8:0<-24,24,0.1>Output Gain (dB)
+slider9:1<0,1,1{Off,On}>Limiter Enable
+slider10:0<0,1,1{Peak,True Peak}>Limiter Mode
+slider11:2<0,5,1{Instant,Fast,Medium,Slow,Very Slow,Extra Slow}>Meter Smoothing
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+PI = 3.14159265359;
+LOG10 = 2.30258509299;
+SQRT2 = 1.41421356237;
+
+// Level measurement variables
+peak_level = 0;
+rms_sum_L = 0;
+rms_sum_R = 0;
+rms_count = 0;
+rms_window = 0.1 * srate; // 100ms window for RMS
+
+// LUFS variables
+lufs_buffer_size = 0.4 * srate; // 400ms for LUFS Short
+lufs_buffer_L = 0;
+lufs_buffer_R = lufs_buffer_size;
+lufs_write_pos = 0;
+lufs_sum_L = 0;
+lufs_sum_R = 0;
+
+// Long window for LUFS Momentary (3 seconds)
+lufs_long_size = 3 * srate;
+lufs_long_L = lufs_buffer_size * 2;
+lufs_long_R = lufs_buffer_size * 2 + lufs_long_size;
+lufs_long_pos = 0;
+lufs_long_sum_L = 0;
+lufs_long_sum_R = 0;
+
+// Gain smoothing
+current_gain = 1.0;
+target_gain = 1.0;
+startup_counter = 0.5 * srate; // 0.5 seconds of gentle startup
+
+// Attack/Release parameters
+attack_coeff = 0.999;
+release_coeff = 0.999;
+
+// Mode switching stability
+prev_mode = 0;
+mode_change_counter = 0;
+mode_stability_samples = 0.5 * srate; // 500ms to stabilize
+
+// Silence detection for reset
+silence_counter = 0;
+silence_threshold = 0.00000001; // Very quiet threshold
+silence_samples_to_reset = 0.1 * srate; // 100ms of silence to reset
+
+// Track previous slider values to detect changes
+prev_target_min = -30;
+prev_target_max = -10;
+
+// Smoothed display levels for meters
+input_level_smooth = -60;
+processed_level_smooth = -60;
+
+// Fade in/out for smooth start/stop
+fade_envelope = 1.0;
+fade_target = 1.0;
+
+// K-weighting coefficients for LUFS (simplified version)
+k_weight_a = 1.53512485958697;
+k_weight_b = 2.69169618940638;
+
+// True Limiter variables
+limiter_buffer_size = 64; // samples for oversampling
+limiter_buffer_L = lufs_buffer_size * 2 + lufs_long_size * 2;
+limiter_buffer_R = limiter_buffer_L + limiter_buffer_size;
+limiter_pos = 0;
+limiter_gain = 1.0;
+limiter_envelope = 0.0;
+gain_reduction_display = 0.0;
+
+@slider
+input_gain_linear = 10^(slider1/20);
+mode = slider2;
+
+// Convert Attack/Release from milliseconds to coefficients
+attack_ms = slider4;
+release_ms = slider5;
+attack_coeff = exp(-1000 / (attack_ms * srate));
+release_coeff = exp(-1000 / (release_ms * srate));
+
+// Smart slider linking - detect which slider changed and move the other accordingly
+target_range_min = slider6;
+target_range_max = slider7;
+
+// Check which slider changed
+min_changed = (target_range_min != prev_target_min);
+max_changed = (target_range_max != prev_target_max);
+
+min_changed && !max_changed && target_range_min > target_range_max ? (
+  target_range_max = target_range_min;
+  slider7 = target_range_max;
+  sliderchange(slider7);
+  startup_counter = max(startup_counter, 0.2 * srate);
+) : max_changed && !min_changed && target_range_max < target_range_min ? (
+  target_range_min = target_range_max;
+  slider6 = target_range_min;
+  sliderchange(slider6);
+  startup_counter = max(startup_counter, 0.2 * srate);
+) : target_range_min > target_range_max ? (
+  target_range_min = target_range_max;
+  slider6 = target_range_min;
+  sliderchange(slider6);
+  startup_counter = max(startup_counter, 0.2 * srate);
+);
+
+prev_target_min = target_range_min;
+prev_target_max = target_range_max;
+
+output_gain_linear = 10^(slider8/20);
+limiter_enable = slider9;
+limiter_mode = slider10;
+meter_smoothing = slider11;
+
+// Set meter smoothing coefficients - more aggressive
+meter_smoothing == 0 ? (
+  meter_smooth_coeff = 0.0; // Instant
+) : meter_smoothing == 1 ? (
+  meter_smooth_coeff = 0.9; // Fast
+) : meter_smoothing == 2 ? (
+  meter_smooth_coeff = 0.96; // Medium
+) : meter_smoothing == 3 ? (
+  meter_smooth_coeff = 0.985; // Slow
+) : meter_smoothing == 4 ? (
+  meter_smooth_coeff = 0.995; // Very Slow
+) : meter_smooth_coeff = 0.998; // Extra Slow
+
+// Check for mode change
+mode != prev_mode ? (
+  mode_change_counter = mode_stability_samples;
+  prev_mode = mode;
+);
+
+@sample
+spl0 *= input_gain_linear;
+spl1 *= input_gain_linear;
+
+input_magnitude = max(abs(spl0), abs(spl1));
+
+input_magnitude > 0.0001 ? (
+  fade_target = 1.0;
+) : (
+  fade_target = 0.0;
+);
+fade_envelope = fade_envelope * 0.999 + fade_target * 0.001;
+
+spl0 == 0 && spl1 == 0 ? (
+  current_gain = current_gain * 0.998 + 1.0 * 0.002;
+  target_gain = target_gain * 0.998 + 1.0 * 0.002;
+  peak_level *= 0.99;
+  rms_sum_L *= 0.99;
+  rms_sum_R *= 0.99;
+  gain_reduction_display *= 0.97;
+  input_level_smooth = input_level_smooth * 0.92 - 0.5;
+  processed_level_smooth = processed_level_smooth * 0.92 - 0.5;
+  input_level_smooth = max(input_level_smooth, -96);
+  processed_level_smooth = max(processed_level_smooth, -96);
+) : input_magnitude < silence_threshold ? (
+  silence_counter += 1;
+  silence_counter >= silence_samples_to_reset ? (
+    current_gain = current_gain * 0.999 + 1.0 * 0.001;
+    target_gain = target_gain * 0.999 + 1.0 * 0.001;
+    peak_level *= 0.99;
+    rms_sum_L *= 0.99;
+    rms_sum_R *= 0.99;
+    gain_reduction_display *= 0.95;
+    mode_change_counter = max(0, mode_change_counter - 1);
+    input_level_smooth *= 0.995;
+    processed_level_smooth *= 0.995;
+  );
+) : (
+  silence_counter = 0;
+);
+
+current_level = 0;
+
+// --- MATCHED LOGIC FOR BOTH METERS ---
+mode == 0 ? (
+  peak_L = abs(spl0);
+  peak_R = abs(spl1);
+  instant_peak = max(peak_L, peak_R);
+  peak_decay = exp(-1 / (0.1 * srate));
+  peak_level = max(instant_peak, peak_level * peak_decay);
+  current_level = peak_level > 0 ? 20 * log(peak_level) / LOG10 : -96;
+  input_level_display = current_level;
+) : mode == 1 ? (
+  weighted_L = spl0 * k_weight_a;
+  weighted_R = spl1 * k_weight_a;
+  old_L = lufs_buffer_L[lufs_write_pos];
+  old_R = lufs_buffer_R[lufs_write_pos];
+  lufs_buffer_L[lufs_write_pos] = weighted_L * weighted_L;
+  lufs_buffer_R[lufs_write_pos] = weighted_R * weighted_R;
+  lufs_sum_L = lufs_sum_L - old_L + lufs_buffer_L[lufs_write_pos];
+  lufs_sum_R = lufs_sum_R - old_R + lufs_buffer_R[lufs_write_pos];
+  lufs_write_pos = (lufs_write_pos + 1) % lufs_buffer_size;
+  mean_square = (lufs_sum_L + lufs_sum_R) / (lufs_buffer_size * 2);
+  current_level = mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+  input_level_display = current_level;
+) : mode == 2 ? (
+  weighted_L = spl0 * k_weight_a;
+  weighted_R = spl1 * k_weight_a;
+  old_L = lufs_long_L[lufs_long_pos];
+  old_R = lufs_long_R[lufs_long_pos];
+  lufs_long_L[lufs_long_pos] = weighted_L * weighted_L;
+  lufs_long_R[lufs_long_pos] = weighted_R * weighted_R;
+  lufs_long_sum_L = lufs_long_sum_L - old_L + lufs_long_L[lufs_long_pos];
+  lufs_long_sum_R = lufs_long_sum_R - old_R + lufs_long_R[lufs_long_pos];
+  lufs_long_pos = (lufs_long_pos + 1) % lufs_long_size;
+  mean_square = (lufs_long_sum_L + lufs_long_sum_R) / (lufs_long_size * 2);
+  current_level = mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+  input_level_display = current_level;
+) : (
+  rms_coeff = exp(-1 / (0.3 * srate));
+  rms_sum_L = rms_sum_L * rms_coeff + spl0 * spl0 * (1 - rms_coeff);
+  rms_sum_R = rms_sum_R * rms_coeff + spl1 * spl1 * (1 - rms_coeff);
+  rms_level = sqrt((rms_sum_L + rms_sum_R) / 2);
+  current_level = rms_level > 0 ? 20 * log(rms_level) / LOG10 : -96;
+  input_level_display = current_level;
+);
+
+target_center = (target_range_min + target_range_max) / 2;
+
+// --- ALWAYS TARGET CENTER ---
+level_diff = target_center - current_level;
+desired_gain = 10^(level_diff/20);
+desired_gain = max(0.1, min(10, desired_gain));
+
+startup_counter > 0 ? (
+  startup_counter -= 1;
+  startup_progress = 1.0 - (startup_counter / (0.5 * srate));
+  target_gain = desired_gain * startup_progress + 1.0 * (1.0 - startup_progress);
+) : mode_change_counter > 0 ? (
+  mode_change_counter -= 1;
+  target_gain = current_gain;
+) : (
+  target_gain = desired_gain;
+);
+
+target_gain > current_gain ? (
+  current_gain = current_gain * attack_coeff + target_gain * (1 - attack_coeff);
+) : (
+  current_gain = current_gain * release_coeff + target_gain * (1 - release_coeff);
+);
+
+processed_L = spl0 * current_gain;
+processed_R = spl1 * current_gain;
+
+processed_L *= output_gain_linear;
+processed_R *= output_gain_linear;
+
+// --- MATCHED LOGIC FOR OUTPUT METER (AFTER OUTPUT GAIN) ---
+mode == 0 ? (
+  processed_peak = max(abs(processed_L), abs(processed_R));
+  processed_level_display = processed_peak > 0 ? 20 * log(processed_peak) / LOG10 : -96;
+) : mode == 1 ? (
+  weighted_L = processed_L * k_weight_a;
+  weighted_R = processed_R * k_weight_a;
+  mean_square = (weighted_L * weighted_L + weighted_R * weighted_R) / 2;
+  processed_level_display = mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+) : mode == 2 ? (
+  weighted_L = processed_L * k_weight_a;
+  weighted_R = processed_R * k_weight_a;
+  mean_square = (weighted_L * weighted_L + weighted_R * weighted_R) / 2;
+  processed_level_display = mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+) : (
+  rms_val = sqrt((processed_L * processed_L + processed_R * processed_R) / 2);
+  processed_level_display = rms_val > 0 ? 20 * log(rms_val) / LOG10 : -96;
+);
+
+reduction = 1.0;
+
+limiter_enable ? (
+  limiter_threshold = 0.99;
+  limiter_mode == 0 ? (
+    peak_val = max(abs(processed_L), abs(processed_R));
+    peak_val > limiter_threshold ? (
+      reduction = limiter_threshold / peak_val;
+      processed_L *= reduction;
+      processed_R *= reduction;
+    );
+  ) : (
+    limiter_buffer_L[limiter_pos] = processed_L;
+    limiter_buffer_R[limiter_pos] = processed_R;
+    limiter_pos = (limiter_pos + 1) % limiter_buffer_size;
+    interp_L = (processed_L + limiter_buffer_L[(limiter_pos - 1 + limiter_buffer_size) % limiter_buffer_size]) * 0.5;
+    interp_R = (processed_R + limiter_buffer_R[(limiter_pos - 1 + limiter_buffer_size) % limiter_buffer_size]) * 0.5;
+    true_peak = max(max(abs(processed_L), abs(processed_R)), max(abs(interp_L), abs(interp_R)));
+    true_peak > limiter_threshold ? (
+      reduction = limiter_threshold / true_peak;
+      processed_L *= reduction;
+      processed_R *= reduction;
+    );
+  );
+);
+
+gain_reduction_db = 20 * log(reduction) / LOG10;
+reduction < 1.0 ? (
+  gain_reduction_display = min(gain_reduction_display * 0.8 + gain_reduction_db * 0.2, gain_reduction_db);
+) : (
+  gain_reduction_display *= 0.995;
+);
+
+gain_reduction_display = min(0, gain_reduction_display);
+
+input_level_smooth = input_level_smooth * meter_smooth_coeff + input_level_display * (1 - meter_smooth_coeff);
+processed_level_smooth = processed_level_smooth * meter_smooth_coeff + processed_level_display * (1 - meter_smooth_coeff);
+
+spl0 = processed_L * fade_envelope;
+spl1 = processed_R * fade_envelope;
+
+@gfx 640 480
+gfx_clear = 0x202020;
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_x = 10; gfx_y = 20;
+gfx_printf("Target Range: %.1f to %.1f dB", target_range_min, target_range_max);
+gfx_x = 10; gfx_y = 40;
+gfx_printf("Target Center: %.1f dB", target_center);
+gfx_x = 10; gfx_y = 60;
+gfx_printf("Input Level: %.1f dB", input_level_display);
+gfx_x = 10; gfx_y = 80;
+gfx_printf("Output Level: %.1f dB", processed_level_display);
+gfx_x = 10; gfx_y = 100;
+gfx_printf("Current Gain: %.2f (%.1f dB)", current_gain, 20*log(current_gain)/LOG10);
+
+meter_width = 30;
+meter_height = 320;
+meter_y = 90;
+meter_x = 270;
+proc_meter_x = 320;
+gr_meter_x = 360;
+gr_meter_width = 6;
+input_level_db = input_level_smooth;
+processed_level_db = processed_level_smooth;
+
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_rect(meter_x, meter_y, meter_width, meter_height, 0);
+
+input_fill_height = input_level_db <= -60 ? 0 :
+  input_level_db >= -20 ?
+    ((input_level_db + 20) / 20) * (meter_height * 0.6) :
+    meter_height * 0.6 + ((input_level_db + 20) / 40) * (meter_height * 0.4);
+input_fill_height = max(0, min(meter_height, input_fill_height));
+
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_rect(meter_x + 1, meter_y + meter_height - input_fill_height, meter_width - 2, input_fill_height);
+gfx_x = meter_x + 5; gfx_y = meter_y + meter_height + 10;
+gfx_printf("In");
+
+gfx_r = 0; gfx_g = 1; gfx_b = 0;
+gfx_rect(proc_meter_x, meter_y, meter_width, meter_height, 0);
+
+processed_fill_height = processed_level_db <= -60 ? 0 :
+  processed_level_db >= -20 ?
+    ((processed_level_db + 20) / 20) * (meter_height * 0.6) :
+    meter_height * 0.6 + ((processed_level_db + 20) / 40) * (meter_height * 0.4);
+processed_fill_height = max(0, min(meter_height, processed_fill_height));
+
+gfx_r = 0; gfx_g = 1; gfx_b = 0;
+gfx_rect(proc_meter_x + 1, meter_y + meter_height - processed_fill_height, meter_width - 2, processed_fill_height);
+gfx_x = proc_meter_x + 2; gfx_y = meter_y + meter_height + 10;
+gfx_printf("Out");
+
+// GR meter: только заливка, без рамки
+gr_fill_height = ((-gain_reduction_display) / 20) * meter_height;
+gr_fill_height = max(0, min(meter_height, gr_fill_height));
+gfx_r = 1; gfx_g = 0; gfx_b = 0;
+gfx_rect(gr_meter_x + 1, meter_y + 1, gr_meter_width - 2, gr_fill_height);
+gfx_x = gr_meter_x + 1; gfx_y = meter_y + meter_height + 10;
+gfx_printf("GR");
+
+// Target Range markers (Blue) - укороченные линии
+target_min_pos = meter_y + (target_range_min >= -20 ?
+  ((target_range_min + 20) / 20) * (meter_height * 0.6) :
+  meter_height * 0.6 + ((target_range_min + 20) / 40) * (meter_height * 0.4));
+target_max_pos = meter_y + (target_range_max >= -20 ?
+  ((target_range_max + 20) / 20) * (meter_height * 0.6) :
+  meter_height * 0.6 + ((target_range_max + 20) / 40) * (meter_height * 0.4));
+line_start = meter_x - 10;
+line_end = proc_meter_x + meter_width + 8;
+gfx_r = 0; gfx_g = 0.7; gfx_b = 1;
+gfx_line(line_start, target_min_pos - 1, line_end, target_min_pos - 1);
+gfx_line(line_start, target_min_pos, line_end, target_min_pos);
+gfx_line(line_start, target_min_pos + 1, line_end, target_min_pos + 1);
+gfx_line(line_start, target_max_pos - 1, line_end, target_max_pos - 1);
+gfx_line(line_start, target_max_pos, line_end, target_max_pos);
+gfx_line(line_start, target_max_pos + 1, line_end, target_max_pos + 1);
+
+// Target center line (Pink) - укороченная линия
+target_center_pos = meter_y + (target_center >= -20 ?
+  ((target_center + 20) / 20) * (meter_height * 0.6) :
+  meter_height * 0.6 + ((target_center + 20) / 40) * (meter_height * 0.4));
+gfx_a = 1; gfx_r = 1; gfx_g = 0; gfx_b = 1;
+gfx_line(line_start, target_center_pos - 1, line_end, target_center_pos - 1);
+gfx_line(line_start, target_center_pos, line_end, target_center_pos);
+gfx_line(line_start, target_center_pos + 1, line_end, target_center_pos + 1);
+gfx_x = gr_meter_x + gr_meter_width + 10; gfx_y = target_center_pos - 8;
+gfx_printf("%.1f", target_center);
+
+// dB Scale
+gfx_r = 0.7; gfx_g = 0.7; gfx_b = 0.7;
+scale_pos = meter_y + (0 >= -20 ?
+  ((0 + 20) / 20) * (meter_height * 0.6) :
+  meter_height * 0.6 + ((0 + 20) / 40) * (meter_height * 0.4));
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("0");
+
+scale_pos = meter_y + (-3 >= -20 ?
+  ((-3 + 20) / 20) * (meter_height * 0.6) :
+  meter_height * 0.6 + ((-3 + 20) / 40) * (meter_height * 0.4));
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-3");
+
+scale_pos = meter_y + (-6 >= -20 ?
+  ((-6 + 20) / 20) * (meter_height * 0.6) :
+  meter_height * 0.6 + ((-6 + 20) / 40) * (meter_height * 0.4));
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-6");
+
+scale_pos = meter_y + (-10 >= -20 ?
+  ((-10 + 20) / 20) * (meter_height * 0.6) :
+  meter_height * 0.6 + ((-10 + 20) / 40) * (meter_height * 0.4));
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-10");
+
+scale_pos = meter_y + (-15 >= -20 ?
+  ((-15 + 20) / 20) * (meter_height * 0.6) :
+  meter_height * 0.6 + ((-15 + 20) / 40) * (meter_height * 0.4));
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-15");
+
+scale_pos = meter_y + (-20 >= -20 ?
+  ((-20 + 20) / 20) * (meter_height * 0.6) :
+  meter_height * 0.6 + ((-20 + 20) / 40) * (meter_height * 0.4));
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-20");
+
+scale_pos = meter_y + (-40 >= -20 ?
+  ((-40 + 20) / 20) * (meter_height * 0.6) :
+  meter_height * 0.6 + ((-40 + 20) / 40) * (meter_height * 0.4));
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-40");
+
+scale_pos = meter_y + (-60 >= -20 ?
+  ((-60 + 20) / 20) * (meter_height * 0.6) :
+  meter_height * 0.6 + ((-60 + 20) / 40) * (meter_height * 0.4));
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-60");
