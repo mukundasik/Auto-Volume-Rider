@@ -114,6 +114,87 @@ pdc_bot_ch = 0;
 pdc_top_ch = 2;
 pdc_delay = 0; // Будет обновлено в @slider
 
+// Функция анализа будущего сигнала
+function analyze_future_signal() (
+  future_pos = lookahead_analysis_pos;
+  analysis_samples = min(lookahead_samples, 1024); // Ограничиваем анализ для производительности
+  level_sum = 0;
+  sample_count = 0;
+  
+  // Анализируем будущие сэмплы
+  loop(analysis_samples,
+    future_sample_L = lookahead_analysis_buffer_L[future_pos];
+    future_sample_R = lookahead_analysis_buffer_R[future_pos];
+    
+    // Измеряем уровень в зависимости от режима
+    mode == 0 ? (
+      // Peak mode
+      future_peak = max(abs(future_sample_L), abs(future_sample_R));
+      level_sum += future_peak;
+    ) : mode == 1 || mode == 2 ? (
+      // LUFS mode (упрощенный)
+      weighted_L = future_sample_L * k_weight_a;
+      weighted_R = future_sample_R * k_weight_a;
+      level_sum += (weighted_L * weighted_L + weighted_R * weighted_R) / 2;
+    ) : (
+      // RMS mode
+      level_sum += (future_sample_L * future_sample_L + future_sample_R * future_sample_R) / 2;
+    );
+    
+    sample_count += 1;
+    future_pos = (future_pos + 1) % max_lookahead_samples;
+  );
+  
+  // Возвращаем средний уровень
+  sample_count > 0 ? level_sum / sample_count : 0;
+);
+
+// Функция расчета будущего gain
+function calculate_future_gain(future_level) (
+  // Конвертируем уровень в dB
+  future_level_db = 0;
+  
+  mode == 0 ? (
+    // Peak mode
+    future_level_db = future_level > 0 ? 20 * log(future_level) / LOG10 : -96;
+  ) : mode == 1 || mode == 2 ? (
+    // LUFS mode
+    future_level_db = future_level > 0 ? -0.691 + 10 * log(future_level) / LOG10 : -96;
+  ) : (
+    // RMS mode
+    future_level_db = future_level > 0 ? 20 * log(sqrt(future_level)) / LOG10 : -96;
+  );
+  
+  // Calculate target level in the middle of the range window
+  target_center = (target_range_min + target_range_max) / 2;
+  
+  // Calculate level difference
+  level_diff = 0;
+  future_level_db < target_range_min ? (
+    level_diff = target_range_min - future_level_db;
+  ) : future_level_db > target_range_max ? (
+    level_diff = target_range_max - future_level_db;
+  );
+  
+  // Calculate desired gain
+  desired_gain = level_diff != 0 ? 10^(level_diff/20) : 1.0;
+  
+  // Limit gain to safe bounds
+  desired_gain = max(0.1, min(10, desired_gain));
+  
+  // Handle startup and mode switching stability
+  startup_counter > 0 ? (
+    startup_ratio = startup_counter / (0.5 * srate);
+    startup_progress = 1.0 - startup_ratio;
+    unity_weight = 1.0 - startup_progress;
+    desired_gain = desired_gain * startup_progress + 1.0 * unity_weight;
+  ) : mode_change_counter > 0 ? (
+    desired_gain = current_gain;
+  );
+  
+  desired_gain;
+);
+
 @slider
 input_gain_linear = 10^(slider1/20);
 mode = slider2;
@@ -342,87 +423,6 @@ processed_level_smooth = processed_level_smooth * meter_smooth_coeff + processed
 // Apply fade envelope for smooth start/stop
 spl0 = processed_L * fade_envelope;
 spl1 = processed_R * fade_envelope;
-
-// Функция анализа будущего сигнала
-function analyze_future_signal() (
-  future_pos = lookahead_analysis_pos;
-  analysis_samples = min(lookahead_samples, 1024); // Ограничиваем анализ для производительности
-  level_sum = 0;
-  sample_count = 0;
-  
-  // Анализируем будущие сэмплы
-  loop(analysis_samples,
-    future_sample_L = lookahead_analysis_buffer_L[future_pos];
-    future_sample_R = lookahead_analysis_buffer_R[future_pos];
-    
-    // Измеряем уровень в зависимости от режима
-    mode == 0 ? (
-      // Peak mode
-      future_peak = max(abs(future_sample_L), abs(future_sample_R));
-      level_sum += future_peak;
-    ) : mode == 1 || mode == 2 ? (
-      // LUFS mode (упрощенный)
-      weighted_L = future_sample_L * k_weight_a;
-      weighted_R = future_sample_R * k_weight_a;
-      level_sum += (weighted_L * weighted_L + weighted_R * weighted_R) / 2;
-    ) : (
-      // RMS mode
-      level_sum += (future_sample_L * future_sample_L + future_sample_R * future_sample_R) / 2;
-    );
-    
-    sample_count += 1;
-    future_pos = (future_pos + 1) % max_lookahead_samples;
-  );
-  
-  // Возвращаем средний уровень
-  sample_count > 0 ? level_sum / sample_count : 0;
-);
-
-// Функция расчета будущего gain
-function calculate_future_gain(future_level) (
-  // Конвертируем уровень в dB
-  future_level_db = 0;
-  
-  mode == 0 ? (
-    // Peak mode
-    future_level_db = future_level > 0 ? 20 * log(future_level) / LOG10 : -96;
-  ) : mode == 1 || mode == 2 ? (
-    // LUFS mode
-    future_level_db = future_level > 0 ? -0.691 + 10 * log(future_level) / LOG10 : -96;
-  ) : (
-    // RMS mode
-    future_level_db = future_level > 0 ? 20 * log(sqrt(future_level)) / LOG10 : -96;
-  );
-  
-  // Calculate target level in the middle of the range window
-  target_center = (target_range_min + target_range_max) / 2;
-  
-  // Calculate level difference
-  level_diff = 0;
-  future_level_db < target_range_min ? (
-    level_diff = target_range_min - future_level_db;
-  ) : future_level_db > target_range_max ? (
-    level_diff = target_range_max - future_level_db;
-  );
-  
-  // Calculate desired gain
-  desired_gain = level_diff != 0 ? 10^(level_diff/20) : 1.0;
-  
-  // Limit gain to safe bounds
-  desired_gain = max(0.1, min(10, desired_gain));
-  
-  // Handle startup and mode switching stability
-  startup_counter > 0 ? (
-    startup_ratio = startup_counter / (0.5 * srate);
-    startup_progress = 1.0 - startup_ratio;
-    unity_weight = 1.0 - startup_progress;
-    desired_gain = desired_gain * startup_progress + 1.0 * unity_weight;
-  ) : mode_change_counter > 0 ? (
-    desired_gain = current_gain;
-  );
-  
-  desired_gain;
-);
 
 @gfx 640 480
 // Clear background
