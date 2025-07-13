@@ -42,15 +42,15 @@ rms_window = 0.1 * srate; // 100ms window for RMS
 // LUFS variables
 lufs_buffer_size = 0.4 * srate; // 400ms for LUFS Short
 lufs_buffer_L = max_lookahead_samples * 2;
-lufs_buffer_R = max_lookahead_samples * 2 + lufs_buffer_size;
+lufs_buffer_R = lufs_buffer_L + lufs_buffer_size;
 lufs_write_pos = 0;
 lufs_sum_L = 0;
 lufs_sum_R = 0;
 
 // Long window for LUFS Momentary (3 seconds)
 lufs_long_size = 3 * srate;
-lufs_long_L = max_lookahead_samples * 2 + lufs_buffer_size * 2;
-lufs_long_R = max_lookahead_samples * 2 + lufs_buffer_size * 2 + lufs_long_size;
+lufs_long_L = lufs_buffer_R + lufs_buffer_size;
+lufs_long_R = lufs_long_L + lufs_long_size;
 lufs_long_pos = 0;
 lufs_long_sum_L = 0;
 lufs_long_sum_R = 0;
@@ -98,7 +98,7 @@ k_weight_b = 2.69169618940638;
 
 // True Peak Limiter variables
 limiter_buffer_size = 64; // samples for oversampling
-limiter_buffer_L = max_lookahead_samples * 2 + lufs_buffer_size * 2 + lufs_long_size * 2;
+limiter_buffer_L = lufs_long_R + lufs_long_size;
 limiter_buffer_R = limiter_buffer_L + limiter_buffer_size;
 limiter_pos = 0;
 limiter_gain = 1.0;
@@ -322,7 +322,8 @@ lookahead_samples > 0 ? (
   avg_level = lookahead_avg_count > 0 ? lookahead_avg_sum / lookahead_avg_count : 0;
   predicted_level_db = avg_level > 0 ? 20 * log(avg_level) / LOG10 : -96;
   // Смешиваем текущий уровень с предсказанным
-  lookahead_weight = min(lookahead_samples / (0.1 * srate), 0.3); // Максимум 30% вес
+  lookahead_ratio = lookahead_samples / (0.1 * srate);
+  lookahead_weight = min(lookahead_ratio, 0.3); // Максимум 30% вес
   predicted_level = current_level * (1 - lookahead_weight) + predicted_level_db * lookahead_weight;
 ) : (
   predicted_level = current_level;
@@ -353,8 +354,10 @@ desired_gain = max(0.1, min(10, desired_gain));
 startup_counter > 0 ? (
   startup_counter -= 1;
   // Gentle startup - gradually transition from unity gain
-  startup_progress = 1.0 - (startup_counter / (0.5 * srate));
-  target_gain = desired_gain * startup_progress + 1.0 * (1.0 - startup_progress);
+  startup_ratio = startup_counter / (0.5 * srate);
+  startup_progress = 1.0 - startup_ratio;
+  unity_weight = 1.0 - startup_progress;
+  target_gain = desired_gain * startup_progress + 1.0 * unity_weight;
 ) : mode_change_counter > 0 ? (
   mode_change_counter -= 1;
   // Keep previous gain during stabilization
@@ -367,10 +370,12 @@ startup_counter > 0 ? (
 // Apply Attack/Release for smoothing
 target_gain > current_gain ? (
   // Attack - fast reaction to level increase
-  current_gain = current_gain * attack_coeff + target_gain * (1 - attack_coeff);
+  attack_weight = 1 - attack_coeff;
+  current_gain = current_gain * attack_coeff + target_gain * attack_weight;
 ) : (
   // Release - slow reaction to level decrease
-  current_gain = current_gain * release_coeff + target_gain * (1 - release_coeff);
+  release_weight = 1 - release_coeff;
+  current_gain = current_gain * release_coeff + target_gain * release_weight;
 );
 
 // Apply gain to delayed signal
@@ -421,8 +426,9 @@ limiter_enable ? (
     limiter_pos = (limiter_pos + 1) % limiter_buffer_size;
     
     // Check for intersample peaks (simplified)
-    interp_L = (processed_L + limiter_buffer_L[(limiter_pos - 1 + limiter_buffer_size) % limiter_buffer_size]) * 0.5;
-    interp_R = (processed_R + limiter_buffer_R[(limiter_pos - 1 + limiter_buffer_size) % limiter_buffer_size]) * 0.5;
+    prev_pos = (limiter_pos - 1 + limiter_buffer_size) % limiter_buffer_size;
+    interp_L = (processed_L + limiter_buffer_L[prev_pos]) * 0.5;
+    interp_R = (processed_R + limiter_buffer_R[prev_pos]) * 0.5;
     
     true_peak = max(max(abs(processed_L), abs(processed_R)), max(abs(interp_L), abs(interp_R)));
     
