@@ -69,7 +69,7 @@ mode_stability_samples = 0.5 * srate; // 500ms to stabilize
 
 // Silence detection for reset
 silence_counter = 0;
-silence_threshold = 1e-8; // Very quiet threshold
+silence_threshold = 0.00000001; // Very quiet threshold
 silence_samples_to_reset = 0.1 * srate; // 100ms of silence to reset
 
 // K-weighting coefficients for LUFS (simplified version)
