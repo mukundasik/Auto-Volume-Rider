@@ -13,6 +13,7 @@ slider7:-10<-60,0,0.1>Target Range Max (dB)
 slider8:0<-24,24,0.1>Output Gain (dB)
 slider9:1<0,1,1{Off,On}>Limiter Enable
 slider10:0<0,1,1{Peak,True Peak}>Limiter Mode
+slider11:2<0,4,1{Instant,Fast,Medium,Slow,Very Slow}>Meter Smoothing
 
 in_pin:left input
 in_pin:right input
@@ -76,6 +77,10 @@ silence_samples_to_reset = 0.1 * srate; // 100ms of silence to reset
 // Track previous slider values to detect changes
 prev_target_min = -30;
 prev_target_max = -10;
+
+// Smoothed display levels for meters
+input_level_smooth = -60;
+processed_level_smooth = -60;
 
 // K-weighting coefficients for LUFS (simplified version)
 k_weight_a = 1.53512485958697;
@@ -142,6 +147,20 @@ prev_target_max = target_range_max;
 output_gain_linear = 10^(slider8/20);
 limiter_enable = slider9;
 limiter_mode = slider10;
+meter_smoothing = slider11;
+
+// Set meter smoothing coefficients
+meter_smoothing == 0 ? (
+  meter_smooth_coeff = 0.0; // Instant
+) : meter_smoothing == 1 ? (
+  meter_smooth_coeff = 0.8; // Fast
+) : meter_smoothing == 2 ? (
+  meter_smooth_coeff = 0.9; // Medium
+) : meter_smoothing == 3 ? (
+  meter_smooth_coeff = 0.95; // Slow
+) : (
+  meter_smooth_coeff = 0.98; // Very Slow
+);
 
 // Update PDC when lookahead changes
 pdc_delay = lookahead_samples;
@@ -185,33 +204,12 @@ spl0 == 0 && spl1 == 0 ? (
   silence_counter = 0; // Reset silence counter when signal is present
 );
 
-// Function to measure level in current mode
-function measure_level(L, R, measurement_mode) (
-  measurement_mode == 0 ? (
-    // Peak mode
-    peak_val = max(abs(L), abs(R));
-    peak_val > 0 ? 20 * log(peak_val) / LOG10 : -96;
-  ) : measurement_mode == 1 ? (
-    // LUFS Short - simplified for display
-    weighted_L = L * k_weight_a;
-    weighted_R = R * k_weight_a;
-    mean_square = (weighted_L * weighted_L + weighted_R * weighted_R) / 2;
-    mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
-  ) : measurement_mode == 2 ? (
-    // LUFS Momentary - simplified for display
-    weighted_L = L * k_weight_a;
-    weighted_R = R * k_weight_a;
-    mean_square = (weighted_L * weighted_L + weighted_R * weighted_R) / 2;
-    mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
-  ) : (
-    // RMS mode
-    rms_val = sqrt((L * L + R * R) / 2);
-    rms_val > 0 ? 20 * log(rms_val) / LOG10 : -96;
-  );
-);
+// Store input level for display - use the SAME values as main logic
+input_level_display = current_level;
 
-// Store input level for display using current mode
-input_level_display = measure_level(spl0, spl1, mode);
+// Apply smoothing to meter display values
+input_level_smooth = input_level_smooth * meter_smooth_coeff + input_level_display * (1 - meter_smooth_coeff);
+processed_level_smooth = processed_level_smooth * meter_smooth_coeff + processed_level_display * (1 - meter_smooth_coeff);
 
 // Write to lookahead buffer
 lookahead_buffer_L[write_pos] = spl0;
@@ -322,8 +320,22 @@ target_gain > current_gain ? (
 processed_L = delayed_L * current_gain;
 processed_R = delayed_R * current_gain;
 
-// Store processed level for display using current mode
-processed_level_display = measure_level(processed_L, processed_R, mode);
+// Calculate processed level in the same MODE as input level
+mode == 0 ? (
+  // Peak mode for processed signal
+  processed_peak = max(abs(processed_L), abs(processed_R));
+  processed_level_display = processed_peak > 0 ? 20 * log(processed_peak) / LOG10 : -96;
+) : mode == 1 || mode == 2 ? (
+  // LUFS mode for processed signal (simplified)
+  weighted_L = processed_L * k_weight_a;
+  weighted_R = processed_R * k_weight_a;
+  mean_square = (weighted_L * weighted_L + weighted_R * weighted_R) / 2;
+  processed_level_display = mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+) : (
+  // RMS mode for processed signal
+  rms_val = sqrt((processed_L * processed_L + processed_R * processed_R) / 2);
+  processed_level_display = rms_val > 0 ? 20 * log(rms_val) / LOG10 : -96;
+);
 
 // Apply output gain
 processed_L *= output_gain_linear;
@@ -401,21 +413,21 @@ gfx_printf("Output Level: %.1f dB", processed_level_display);
 // Vertical meters - properly centered in 640px window
 // Window width = 640, center = 320
 // Meter setup: Input(white) - space - Output(green) - space - GR(red)
-meter_width = 20;
+meter_width = 30; // Wider meters (was 20)
 meter_height = 320;
 meter_y = 90;
 
 // Input meter (white) - left of center  
-meter_x = 260;
-// Output meter (green) - right of center
-proc_meter_x = 320;
-// GR meter (red) - further right
-gr_meter_x = 360;
-gr_meter_width = 10;
+meter_x = 270; // Moved closer to center
+// Output meter (green) - right of center, closer spacing
+proc_meter_x = 320; // Closer spacing (was 360 apart, now 50)
+// GR meter (red) - further right, thinner
+gr_meter_x = 370;
+gr_meter_width = 6; // Thinner GR meter (was 10)
 
-// Levels are already in dB from measure_level function
-input_level_db = input_level_display;
-processed_level_db = processed_level_display;
+// Use smoothed levels for display
+input_level_db = input_level_smooth;
+processed_level_db = processed_level_smooth;
 
 // Input Level Meter (White)
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
@@ -482,6 +494,10 @@ gfx_line(meter_x - 10, target_max_pos, gr_meter_x + gr_meter_width + 5, target_m
 target_center_pos = meter_y + db_to_pixel(target_center);
 gfx_r = 1; gfx_g = 0; gfx_b = 0;
 gfx_line(meter_x - 10, target_center_pos, gr_meter_x + gr_meter_width + 5, target_center_pos);
+
+// Display target center value next to the red line
+gfx_x = gr_meter_x + gr_meter_width + 10; gfx_y = target_center_pos - 8;
+gfx_printf("%.1f", target_center);
 
 // dB Scale
 gfx_r = 0.7; gfx_g = 0.7; gfx_b = 0.7;
