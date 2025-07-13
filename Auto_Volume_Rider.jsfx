@@ -182,12 +182,17 @@ input_magnitude = max(abs(spl0), abs(spl1));
 // Check for complete silence (playback stopped)
 spl0 == 0 && spl1 == 0 ? (
   // Immediate but gentle reset for complete silence
-  current_gain = current_gain * 0.99 + 1.0 * 0.01;
-  target_gain = target_gain * 0.99 + 1.0 * 0.01;
-  peak_level *= 0.95;
-  rms_sum_L *= 0.95;
-  rms_sum_R *= 0.95;
-  gain_reduction_display *= 0.9;
+  current_gain = current_gain * 0.995 + 1.0 * 0.005; // More gentle transition
+  target_gain = target_gain * 0.995 + 1.0 * 0.005;
+  peak_level *= 0.98;
+  rms_sum_L *= 0.98;
+  rms_sum_R *= 0.98;
+  gain_reduction_display *= 0.95;
+  // Force meter displays to decay to silence
+  input_level_display = min(input_level_display, -96);
+  processed_level_display = min(processed_level_display, -96);
+  input_level_smooth = min(input_level_smooth * 0.9, -60);
+  processed_level_smooth = min(processed_level_smooth * 0.9, -60);
 ) : input_magnitude < silence_threshold ? (
   silence_counter += 1;
   silence_counter >= silence_samples_to_reset ? (
@@ -199,6 +204,9 @@ spl0 == 0 && spl1 == 0 ? (
     rms_sum_R *= 0.99;
     gain_reduction_display *= 0.95; // Fade out GR display
     mode_change_counter = max(0, mode_change_counter - 1); // Reset mode transition gradually
+    // Gradually lower meter displays during prolonged silence
+    input_level_smooth *= 0.995;
+    processed_level_smooth *= 0.995;
   );
 ) : (
   silence_counter = 0; // Reset silence counter when signal is present
@@ -207,9 +215,8 @@ spl0 == 0 && spl1 == 0 ? (
 // Store input level for display - use the SAME values as main logic
 input_level_display = current_level;
 
-// Apply smoothing to meter display values
-input_level_smooth = input_level_smooth * meter_smooth_coeff + input_level_display * (1 - meter_smooth_coeff);
-processed_level_smooth = processed_level_smooth * meter_smooth_coeff + processed_level_display * (1 - meter_smooth_coeff);
+// Apply smoothing to meter display values - but only after the main logic runs
+// This will be moved later in the code
 
 // Write to lookahead buffer
 lookahead_buffer_L[write_pos] = spl0;
@@ -281,13 +288,24 @@ mode == 0 ? (
   current_level = rms_level > 0 ? 20 * log(rms_level) / LOG10 : -96;
 );
 
-// NEW LOGIC: Target Range Window
+// NEW LOGIC: Target Range Window with "breathing room"
 // Calculate target level in the middle of the range window
 target_center = (target_range_min + target_range_max) / 2;
 
-// Calculate required gain to bring current level to target center
-level_diff = target_center - current_level;
-desired_gain = 10^(level_diff/20);
+// Only adjust if outside the target range (not forcing to center)
+level_diff = 0;
+current_level < target_range_min ? (
+  // Too quiet - bring up to range minimum
+  level_diff = target_range_min - current_level;
+) : current_level > target_range_max ? (
+  // Too loud - bring down to range maximum  
+  level_diff = target_range_max - current_level;
+) : (
+  // Within range - no adjustment needed
+  level_diff = 0;
+);
+
+desired_gain = level_diff != 0 ? 10^(level_diff/20) : 1.0;
 
 // Limit gain to safe bounds to prevent clipping
 desired_gain = max(0.1, min(10, desired_gain));
@@ -391,6 +409,10 @@ reduction < 1.0 ? (
 // Ensure gain reduction is negative (for display purposes)
 gain_reduction_display = min(0, gain_reduction_display);
 
+// Apply smoothing to meter display values at the end
+input_level_smooth = input_level_smooth * meter_smooth_coeff + input_level_display * (1 - meter_smooth_coeff);
+processed_level_smooth = processed_level_smooth * meter_smooth_coeff + processed_level_display * (1 - meter_smooth_coeff);
+
 // Output
 spl0 = processed_L;
 spl1 = processed_R;
@@ -485,17 +507,17 @@ gfx_printf("GR");
 target_min_pos = meter_y + db_to_pixel(target_range_min);
 target_max_pos = meter_y + db_to_pixel(target_range_max);
 
-// Target range markers (Yellow)
-gfx_r = 1; gfx_g = 1; gfx_b = 0;
+// Target range markers (Blue)
+gfx_r = 0; gfx_g = 0.7; gfx_b = 1;
 gfx_line(meter_x - 10, target_min_pos, gr_meter_x + gr_meter_width + 5, target_min_pos);
 gfx_line(meter_x - 10, target_max_pos, gr_meter_x + gr_meter_width + 5, target_max_pos);
 
-// Target center line (Red)
+// Target center line (Pink)
 target_center_pos = meter_y + db_to_pixel(target_center);
-gfx_r = 1; gfx_g = 0; gfx_b = 0;
+gfx_r = 1; gfx_g = 0.4; gfx_b = 1;
 gfx_line(meter_x - 10, target_center_pos, gr_meter_x + gr_meter_width + 5, target_center_pos);
 
-// Display target center value next to the red line
+// Display target center value next to the pink line
 gfx_x = gr_meter_x + gr_meter_width + 10; gfx_y = target_center_pos - 8;
 gfx_printf("%.1f", target_center);
 
