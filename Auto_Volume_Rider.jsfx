@@ -10,9 +10,11 @@ about:
   ## Параметры:
   - Input Gain: Предварительное усиление входного сигнала
   - Mode: Режим измерения (Peak, LUFS S, LUFS M, RMS)
-  - Range Min/Max: Диапазон целевой громкости
+  - Range Min/Max: Границы для входного сигнала (компрессия/экспандинг)
   - Target Output: Целевая выходная громкость
   - Lookahead: Время опережения для более точной обработки
+  - Attack: Скорость реакции на повышение уровня (мс)
+  - Release: Скорость реакции на понижение уровня (мс)
 
 slider1:0<-24,24,0.1>Input Gain (dB)
 slider2:0<0,3,1{Peak,LUFS Short,LUFS Momentary,RMS}>Mode
@@ -20,6 +22,8 @@ slider3:-30<-60,0,0.1>Range Minimum (dB)
 slider4:-6<-60,0,0.1>Range Maximum (dB)
 slider5:-18<-60,0,0.1>Target Output Volume (dB)
 slider6:0.1<0,5,0.01>Lookahead (sec)
+slider7:10<0.1,1000,0.1>Attack (ms)
+slider8:100<1,5000,1>Release (ms)
 
 in_pin:left input
 in_pin:right input
@@ -64,7 +68,10 @@ lufs_long_sum_R = 0;
 // Сглаживание усиления
 current_gain = 1.0;
 target_gain = 1.0;
-gain_smooth = 0.999; // Фактор сглаживания
+
+// Attack/Release параметры
+attack_coeff = 0.999;
+release_coeff = 0.999;
 
 // K-weighting коэффициенты для LUFS (упрощенная версия)
 k_weight_a = 1.53512485958697;
@@ -78,6 +85,12 @@ range_max = slider4;
 target_output = slider5;
 lookahead_time = slider6;
 lookahead_samples = min(max_lookahead_samples, lookahead_time * srate);
+
+// Конвертируем Attack/Release из миллисекунд в коэффициенты
+attack_ms = slider7;
+release_ms = slider8;
+attack_coeff = exp(-1000 / (attack_ms * srate));
+release_coeff = exp(-1000 / (release_ms * srate));
 
 @sample
 // Применяем входное усиление
@@ -150,18 +163,34 @@ mode == 0 ? (
   current_level = rms_level > 0 ? 20 * log(rms_level) / LOG10 : -96;
 );
 
-// Ограничиваем уровень диапазоном
-current_level = max(range_min, min(range_max, current_level));
+// Применяем Range Minimum/Maximum как границы для входного сигнала
+processed_level = current_level;
 
-// Вычисляем необходимое усиление
-level_diff = target_output - current_level;
+// Если сигнал тише чем Range Minimum - подтягиваем до Range Minimum
+processed_level < range_min ? (
+  processed_level = range_min;
+);
+
+// Если сигнал громче чем Range Maximum - опускаем до Range Maximum  
+processed_level > range_max ? (
+  processed_level = range_max;
+);
+
+// Теперь приводим к Target Output Volume
+level_diff = target_output - processed_level;
 target_gain = 10^(level_diff/20);
 
 // Ограничиваем усиление разумными пределами
-target_gain = max(0.1, min(10, target_gain));
+target_gain = max(0.01, min(100, target_gain));
 
-// Сглаживаем изменения усиления
-current_gain = current_gain * gain_smooth + target_gain * (1 - gain_smooth);
+// Применяем Attack/Release для сглаживания
+target_gain > current_gain ? (
+  // Attack - быстрая реакция на повышение уровня
+  current_gain = current_gain * attack_coeff + target_gain * (1 - attack_coeff);
+) : (
+  // Release - медленная реакция на понижение уровня
+  current_gain = current_gain * release_coeff + target_gain * (1 - release_coeff);
+);
 
 // Применяем усиление к задержанному сигналу
 spl0 = delayed_L * current_gain;
@@ -179,23 +208,51 @@ gfx_x = 10; gfx_y = 40;
 gfx_printf("Input Level: %.1f dB", current_level);
 
 gfx_x = 10; gfx_y = 60;
-gfx_printf("Current Gain: %.2f (%.1f dB)", current_gain, 20 * log(current_gain) / LOG10);
+gfx_printf("Processed Level: %.1f dB", processed_level);
 
 gfx_x = 10; gfx_y = 80;
+gfx_printf("Current Gain: %.2f (%.1f dB)", current_gain, 20 * log(current_gain) / LOG10);
+
+gfx_x = 10; gfx_y = 100;
 gfx_printf("Target: %.1f dB", target_output);
 
-// Индикатор уровня
+gfx_x = 10; gfx_y = 120;
+gfx_printf("Range: %.1f to %.1f dB", range_min, range_max);
+
+// Подписи к индикаторам
+gfx_x = 10; gfx_y = 135;
+gfx_printf("Input Level:");
+gfx_x = 10; gfx_y = 155;
+gfx_printf("Processed Level:");
+
+// Индикатор входного уровня
 gfx_r = 0; gfx_g = 1; gfx_b = 0;
 level_bar_width = (current_level + 60) / 60 * 200;
 level_bar_width = max(0, min(200, level_bar_width));
-gfx_rect(10, 100, level_bar_width, 20);
+gfx_rect(10, 150, level_bar_width, 15);
 
-// Рамка индикатора
+// Индикатор обработанного уровня
+gfx_r = 0; gfx_g = 0.8; gfx_b = 1;
+processed_bar_width = (processed_level + 60) / 60 * 200;
+processed_bar_width = max(0, min(200, processed_bar_width));
+gfx_rect(10, 170, processed_bar_width, 15);
+
+// Рамки индикаторов
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
-gfx_rect(10, 100, 200, 20, 0);
+gfx_rect(10, 150, 200, 15, 0);
+gfx_rect(10, 170, 200, 15, 0);
 
 // Целевая отметка
 target_pos = (target_output + 60) / 60 * 200;
 target_pos = max(0, min(200, target_pos));
 gfx_r = 1; gfx_g = 0; gfx_b = 0;
-gfx_line(10 + target_pos, 95, 10 + target_pos, 125);
+gfx_line(10 + target_pos, 145, 10 + target_pos, 190);
+
+// Отметки Range Min/Max
+range_min_pos = (range_min + 60) / 60 * 200;
+range_max_pos = (range_max + 60) / 60 * 200;
+range_min_pos = max(0, min(200, range_min_pos));
+range_max_pos = max(0, min(200, range_max_pos));
+gfx_r = 1; gfx_g = 1; gfx_b = 0;
+gfx_line(10 + range_min_pos, 145, 10 + range_min_pos, 190);
+gfx_line(10 + range_max_pos, 145, 10 + range_max_pos, 190);
