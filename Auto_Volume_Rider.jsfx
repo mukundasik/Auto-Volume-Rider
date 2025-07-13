@@ -5,8 +5,8 @@ changelog:Initial release
 
 slider1:0<-24,24,0.1>Input Gain (dB)
 slider2:0<0,3,1{Peak,LUFS Short,LUFS Momentary,RMS}>Mode
-slider3:-25<-60,0,0.1>Target Range Min (dB)
-slider4:-6<-60,0,0.1>Target Range Max (dB)
+slider3:-55<-60,0,0.1>Target Range Min (dB)
+slider4:-5<-60,0,0.1>Target Range Max (dB)
 slider5:0.1<0,5,0.01>Lookahead (sec)
 slider6:10<0.1,1000,0.1>Attack (ms)
 slider7:100<1,5000,1>Release (ms)
@@ -66,6 +66,11 @@ release_coeff = 0.999;
 prev_mode = 0;
 mode_change_counter = 0;
 mode_stability_samples = 0.5 * srate; // 500ms to stabilize
+
+// Silence detection for reset
+silence_counter = 0;
+silence_threshold = 1e-8; // Very quiet threshold
+silence_samples_to_reset = 0.1 * srate; // 100ms of silence to reset
 
 // K-weighting coefficients for LUFS (simplified version)
 k_weight_a = 1.53512485958697;
@@ -131,6 +136,34 @@ release_coeff = exp(-1000 / (release_ms * srate));
 // Apply input gain
 spl0 *= input_gain_linear;
 spl1 *= input_gain_linear;
+
+// Detect silence to reset plugin state
+input_magnitude = max(abs(spl0), abs(spl1));
+
+// Check for complete silence (playback stopped)
+spl0 == 0 && spl1 == 0 ? (
+  // Immediate but gentle reset for complete silence
+  current_gain = current_gain * 0.99 + 1.0 * 0.01;
+  target_gain = target_gain * 0.99 + 1.0 * 0.01;
+  peak_level *= 0.95;
+  rms_sum_L *= 0.95;
+  rms_sum_R *= 0.95;
+  gain_reduction_display *= 0.9;
+) : input_magnitude < silence_threshold ? (
+  silence_counter += 1;
+  silence_counter >= silence_samples_to_reset ? (
+    // Gradually reset plugin state after prolonged low-level signal
+    current_gain = current_gain * 0.999 + 1.0 * 0.001; // Slowly approach unity gain
+    target_gain = target_gain * 0.999 + 1.0 * 0.001;
+    peak_level *= 0.99; // Decay peak level
+    rms_sum_L *= 0.99; // Decay RMS
+    rms_sum_R *= 0.99;
+    gain_reduction_display *= 0.95; // Fade out GR display
+    mode_change_counter = max(0, mode_change_counter - 1); // Reset mode transition gradually
+  );
+) : (
+  silence_counter = 0; // Reset silence counter when signal is present
+);
 
 // Function to measure level in current mode
 function measure_level(L, R, measurement_mode) (
