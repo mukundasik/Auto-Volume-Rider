@@ -1,0 +1,623 @@
+desc:Auto Volume Rider
+author:AI Assistant
+version:1.0
+changelog:Initial release
+
+slider1:0<-24,24,0.1>Input Gain (dB)
+slider2:0<0,3,1{Peak,LUFS Short,LUFS Momentary,RMS}>Mode
+slider3:0.1<0,5,0.01>Lookahead (sec)
+slider4:20<0.1,1000,0.1>Attack (ms)
+slider5:200<1,5000,1>Release (ms)
+slider6:-30<-60,0,0.1>Target Range Min (dB)
+slider7:-10<-60,0,0.1>Target Range Max (dB)
+slider8:0<-24,24,0.1>Output Gain (dB)
+slider9:1<0,1,1{Off,On}>Limiter Enable
+slider10:0<0,1,1{Peak,True Peak}>Limiter Mode
+slider11:2<0,4,1{Instant,Fast,Medium,Slow,Very Slow}>Meter Smoothing
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+// Constants
+PI = 3.14159265359;
+LOG10 = 2.30258509299;
+SQRT2 = 1.41421356237;
+
+// Lookahead buffers
+max_lookahead_samples = 5 * srate;
+lookahead_buffer_L = 0;
+lookahead_buffer_R = max_lookahead_samples;
+write_pos = 0;
+
+// Level measurement variables
+peak_level = 0;
+rms_sum_L = 0;
+rms_sum_R = 0;
+rms_count = 0;
+rms_window = 0.1 * srate; // 100ms window for RMS
+
+// LUFS variables
+lufs_buffer_size = 0.4 * srate; // 400ms for LUFS Short
+lufs_buffer_L = max_lookahead_samples * 2;
+lufs_buffer_R = max_lookahead_samples * 2 + lufs_buffer_size;
+lufs_write_pos = 0;
+lufs_sum_L = 0;
+lufs_sum_R = 0;
+
+// Long window for LUFS Momentary (3 seconds)
+lufs_long_size = 3 * srate;
+lufs_long_L = max_lookahead_samples * 2 + lufs_buffer_size * 2;
+lufs_long_R = max_lookahead_samples * 2 + lufs_buffer_size * 2 + lufs_long_size;
+lufs_long_pos = 0;
+lufs_long_sum_L = 0;
+lufs_long_sum_R = 0;
+
+// Gain smoothing
+current_gain = 1.0;
+target_gain = 1.0;
+startup_counter = 0.5 * srate; // 0.5 seconds of gentle startup
+
+// Attack/Release parameters
+attack_coeff = 0.999;
+release_coeff = 0.999;
+
+// Mode switching stability
+prev_mode = 0;
+mode_change_counter = 0;
+mode_stability_samples = 0.5 * srate; // 500ms to stabilize
+
+// Silence detection for reset
+silence_counter = 0;
+silence_threshold = 0.00000001; // Very quiet threshold
+silence_samples_to_reset = 0.1 * srate; // 100ms of silence to reset
+
+// Track previous slider values to detect changes
+prev_target_min = -30;
+prev_target_max = -10;
+
+// Smoothed display levels for meters
+input_level_smooth = -60;
+processed_level_smooth = -60;
+
+// Fade in/out for smooth start/stop
+fade_envelope = 1.0;
+fade_target = 1.0;
+
+// Lookahead analysis buffer for real predictive processing
+lookahead_analysis_buffer = max_lookahead_samples * 4;
+lookahead_levels = lookahead_analysis_buffer;
+lookahead_analysis_pos = 0;
+
+// K-weighting coefficients for LUFS (simplified version)
+k_weight_a = 1.53512485958697;
+k_weight_b = 2.69169618940638;
+
+// True Peak Limiter variables
+limiter_buffer_size = 64; // samples for oversampling
+limiter_buffer_L = max_lookahead_samples * 2 + lufs_buffer_size * 2 + lufs_long_size * 2;
+limiter_buffer_R = limiter_buffer_L + limiter_buffer_size;
+limiter_pos = 0;
+limiter_gain = 1.0;
+limiter_envelope = 0.0;
+gain_reduction_display = 0.0;
+
+// Set initial PDC (Plugin Delay Compensation)
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+pdc_delay = lookahead_samples;
+
+@slider
+input_gain_linear = 10^(slider1/20);
+mode = slider2;
+lookahead_time = slider3;
+lookahead_samples = min(max_lookahead_samples, lookahead_time * srate);
+
+// Convert Attack/Release from milliseconds to coefficients
+attack_ms = slider4;
+release_ms = slider5;
+attack_coeff = exp(-1000 / (attack_ms * srate));
+release_coeff = exp(-1000 / (release_ms * srate));
+
+// Smart slider linking - detect which slider changed and move the other accordingly
+target_range_min = slider6;
+target_range_max = slider7;
+
+// Check which slider changed
+min_changed = (target_range_min != prev_target_min);
+max_changed = (target_range_max != prev_target_max);
+
+min_changed && !max_changed && target_range_min > target_range_max ? (
+  // Min slider moved up past max - move max up with it
+  target_range_max = target_range_min;
+  slider7 = target_range_max;
+  sliderchange(slider7);
+  startup_counter = max(startup_counter, 0.2 * srate);
+) : max_changed && !min_changed && target_range_max < target_range_min ? (
+  // Max slider moved down past min - move min down with it  
+  target_range_min = target_range_max;
+  slider6 = target_range_min;
+  sliderchange(slider6);
+  startup_counter = max(startup_counter, 0.2 * srate);
+) : target_range_min > target_range_max ? (
+  // Fallback - if both changed or other edge case
+  target_range_min = target_range_max;
+  slider6 = target_range_min;
+  sliderchange(slider6);
+  startup_counter = max(startup_counter, 0.2 * srate);
+);
+
+// Store current values for next comparison
+prev_target_min = target_range_min;
+prev_target_max = target_range_max;
+
+output_gain_linear = 10^(slider8/20);
+limiter_enable = slider9;
+limiter_mode = slider10;
+meter_smoothing = slider11;
+
+// Set meter smoothing coefficients - more aggressive
+meter_smoothing == 0 ? (
+  meter_smooth_coeff = 0.0; // Instant
+) : meter_smoothing == 1 ? (
+  meter_smooth_coeff = 0.9; // Fast
+) : meter_smoothing == 2 ? (
+  meter_smooth_coeff = 0.96; // Medium
+) : meter_smoothing == 3 ? (
+  meter_smooth_coeff = 0.985; // Slow
+) : (
+  meter_smooth_coeff = 0.995; // Very Slow
+);
+
+// Update PDC when lookahead changes
+pdc_delay = lookahead_samples;
+
+// Check for mode change
+mode != prev_mode ? (
+  mode_change_counter = mode_stability_samples;
+  prev_mode = mode;
+);
+
+@sample
+// Apply input gain
+spl0 *= input_gain_linear;
+spl1 *= input_gain_linear;
+
+// Detect silence to reset plugin state and manage fade envelope
+input_magnitude = max(abs(spl0), abs(spl1));
+
+// Smooth fade in/out envelope
+input_magnitude > 0.0001 ? (
+  fade_target = 1.0; // Signal present - fade in
+) : (
+  fade_target = 0.0; // No signal - fade out  
+);
+fade_envelope = fade_envelope * 0.999 + fade_target * 0.001;
+
+// Check for complete silence (playback stopped)
+spl0 == 0 && spl1 == 0 ? (
+  // Immediate but gentle reset for complete silence
+  current_gain = current_gain * 0.998 + 1.0 * 0.002; // More gentle transition
+  target_gain = target_gain * 0.998 + 1.0 * 0.002;
+  peak_level *= 0.99;
+  rms_sum_L *= 0.99;
+  rms_sum_R *= 0.99;
+  gain_reduction_display *= 0.97;
+  // Force meter displays to decay to silence gradually
+  input_level_smooth = input_level_smooth * 0.92 - 0.5; // Gradual decay toward -infinity
+  processed_level_smooth = processed_level_smooth * 0.92 - 0.5;
+  input_level_smooth = max(input_level_smooth, -96); // Don't go below -96
+  processed_level_smooth = max(processed_level_smooth, -96);
+) : input_magnitude < silence_threshold ? (
+  silence_counter += 1;
+  silence_counter >= silence_samples_to_reset ? (
+    // Gradually reset plugin state after prolonged low-level signal
+    current_gain = current_gain * 0.999 + 1.0 * 0.001; // Slowly approach unity gain
+    target_gain = target_gain * 0.999 + 1.0 * 0.001;
+    peak_level *= 0.99; // Decay peak level
+    rms_sum_L *= 0.99; // Decay RMS
+    rms_sum_R *= 0.99;
+    gain_reduction_display *= 0.95; // Fade out GR display
+    mode_change_counter = max(0, mode_change_counter - 1); // Reset mode transition gradually
+    // Gradually lower meter displays during prolonged silence
+    input_level_smooth *= 0.995;
+    processed_level_smooth *= 0.995;
+  );
+) : (
+  silence_counter = 0; // Reset silence counter when signal is present
+);
+
+// Write to lookahead buffer first
+lookahead_buffer_L[write_pos] = spl0;
+lookahead_buffer_R[write_pos] = spl1;
+
+// REAL LOOKAHEAD: Analyze future signal for predictive gain adjustment
+future_pos = write_pos;
+future_analysis_samples = min(lookahead_samples, max_lookahead_samples / 2);
+future_level_sum = 0;
+future_sample_count = 0;
+
+// Analyze upcoming samples to predict future level
+loop(future_analysis_samples,
+  future_sample_L = lookahead_buffer_L[future_pos];
+  future_sample_R = lookahead_buffer_R[future_pos];
+  future_peak = max(abs(future_sample_L), abs(future_sample_R));
+  future_level_sum += future_peak;
+  future_sample_count += 1;
+  future_pos = (future_pos + 1) % max_lookahead_samples;
+);
+
+// Calculate predicted future level
+future_level_avg = future_sample_count > 0 ? future_level_sum / future_sample_count : 0;
+future_level_db = future_level_avg > 0 ? 20 * log(future_level_avg) / LOG10 : -96;
+
+// Store analysis for predictive adjustment
+lookahead_levels[lookahead_analysis_pos] = future_level_db;
+lookahead_analysis_pos = (lookahead_analysis_pos + 1) % max_lookahead_samples;
+
+// Read from lookahead buffer (delayed signal for processing)
+read_pos = (write_pos - lookahead_samples + max_lookahead_samples) % max_lookahead_samples;
+delayed_L = lookahead_buffer_L[read_pos];
+delayed_R = lookahead_buffer_R[read_pos];
+
+write_pos = (write_pos + 1) % max_lookahead_samples;
+
+// Measure current signal level
+current_level = 0;
+
+// Always calculate the level and desired gain first
+mode == 0 ? (
+  // Peak mode - improved implementation
+  peak_L = abs(spl0);
+  peak_R = abs(spl1);
+  instant_peak = max(peak_L, peak_R);
+  // Use slower decay for peak hold
+  peak_decay = exp(-1 / (0.1 * srate)); // 100ms decay
+  peak_level = max(instant_peak, peak_level * peak_decay);
+  current_level = peak_level > 0 ? 20 * log(peak_level) / LOG10 : -96;
+) : mode == 1 ? (
+  // LUFS Short (400ms)
+  // K-weighting (simplified version)
+  weighted_L = spl0 * k_weight_a;
+  weighted_R = spl1 * k_weight_a;
+  
+  // Update buffer
+  old_L = lufs_buffer_L[lufs_write_pos];
+  old_R = lufs_buffer_R[lufs_write_pos];
+  lufs_buffer_L[lufs_write_pos] = weighted_L * weighted_L;
+  lufs_buffer_R[lufs_write_pos] = weighted_R * weighted_R;
+  
+  // Update sum
+  lufs_sum_L = lufs_sum_L - old_L + lufs_buffer_L[lufs_write_pos];
+  lufs_sum_R = lufs_sum_R - old_R + lufs_buffer_R[lufs_write_pos];
+  
+  lufs_write_pos = (lufs_write_pos + 1) % lufs_buffer_size;
+  
+  mean_square = (lufs_sum_L + lufs_sum_R) / (lufs_buffer_size * 2);
+  current_level = mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+) : mode == 2 ? (
+  // LUFS Momentary (3s)
+  weighted_L = spl0 * k_weight_a;
+  weighted_R = spl1 * k_weight_a;
+  
+  old_L = lufs_long_L[lufs_long_pos];
+  old_R = lufs_long_R[lufs_long_pos];
+  lufs_long_L[lufs_long_pos] = weighted_L * weighted_L;
+  lufs_long_R[lufs_long_pos] = weighted_R * weighted_R;
+  
+  lufs_long_sum_L = lufs_long_sum_L - old_L + lufs_long_L[lufs_long_pos];
+  lufs_long_sum_R = lufs_long_sum_R - old_R + lufs_long_R[lufs_long_pos];
+  
+  lufs_long_pos = (lufs_long_pos + 1) % lufs_long_size;
+  
+  mean_square = (lufs_long_sum_L + lufs_long_sum_R) / (lufs_long_size * 2);
+  current_level = mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+) : (
+  // RMS mode - improved implementation
+  rms_coeff = exp(-1 / (0.3 * srate)); // 300ms time constant
+  rms_sum_L = rms_sum_L * rms_coeff + spl0 * spl0 * (1 - rms_coeff);
+  rms_sum_R = rms_sum_R * rms_coeff + spl1 * spl1 * (1 - rms_coeff);
+  rms_level = sqrt((rms_sum_L + rms_sum_R) / 2);
+  current_level = rms_level > 0 ? 20 * log(rms_level) / LOG10 : -96;
+);
+
+// NEW LOGIC: Target Range Window with "breathing room"
+// Calculate target level in the middle of the range window
+target_center = (target_range_min + target_range_max) / 2;
+
+// Use lookahead prediction for smoother response
+lookahead_samples > 0 ? (
+  // Blend current level with predicted future level for smoother response
+  lookahead_weight = min(lookahead_samples / (0.1 * srate), 0.5); // Max 50% weight
+  predicted_level = current_level * (1 - lookahead_weight) + future_level_db * lookahead_weight;
+) : (
+  predicted_level = current_level;
+);
+
+// Only adjust if outside the target range (not forcing to center)
+level_diff = 0;
+predicted_level < target_range_min ? (
+  // Too quiet - bring up to range minimum  
+  level_diff = target_range_min - predicted_level;
+) : predicted_level > target_range_max ? (
+  // Too loud - bring down to range maximum  
+  level_diff = target_range_max - predicted_level;
+) : (
+  // Within range - no adjustment needed
+  level_diff = 0;
+);
+
+desired_gain = level_diff != 0 ? 10^(level_diff/20) : 1.0;
+
+// Store input level for display - use the SAME values as main logic
+input_level_display = current_level;
+
+// Limit gain to safe bounds to prevent clipping
+desired_gain = max(0.1, min(10, desired_gain));
+
+// Handle startup and mode switching stability  
+startup_counter > 0 ? (
+  startup_counter -= 1;
+  // Gentle startup - gradually transition from unity gain
+  startup_progress = 1.0 - (startup_counter / (0.5 * srate));
+  target_gain = desired_gain * startup_progress + 1.0 * (1.0 - startup_progress);
+) : mode_change_counter > 0 ? (
+  mode_change_counter -= 1;
+  // Keep previous gain during stabilization
+  target_gain = current_gain;
+) : (
+  // Normal operation
+  target_gain = desired_gain;
+);
+
+// Apply Attack/Release for smoothing
+target_gain > current_gain ? (
+  // Attack - fast reaction to level increase
+  current_gain = current_gain * attack_coeff + target_gain * (1 - attack_coeff);
+) : (
+  // Release - slow reaction to level decrease
+  current_gain = current_gain * release_coeff + target_gain * (1 - release_coeff);
+);
+
+// Apply gain to delayed signal
+processed_L = delayed_L * current_gain;
+processed_R = delayed_R * current_gain;
+
+// Calculate processed level in the same MODE as input level
+mode == 0 ? (
+  // Peak mode for processed signal
+  processed_peak = max(abs(processed_L), abs(processed_R));
+  processed_level_display = processed_peak > 0 ? 20 * log(processed_peak) / LOG10 : -96;
+) : mode == 1 || mode == 2 ? (
+  // LUFS mode for processed signal (simplified)
+  weighted_L = processed_L * k_weight_a;
+  weighted_R = processed_R * k_weight_a;
+  mean_square = (weighted_L * weighted_L + weighted_R * weighted_R) / 2;
+  processed_level_display = mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+) : (
+  // RMS mode for processed signal
+  rms_val = sqrt((processed_L * processed_L + processed_R * processed_R) / 2);
+  processed_level_display = rms_val > 0 ? 20 * log(rms_val) / LOG10 : -96;
+);
+
+// Apply output gain
+processed_L *= output_gain_linear;
+processed_R *= output_gain_linear;
+
+// True Peak Limiter
+reduction = 1.0;  // Default no reduction
+
+limiter_enable ? (
+  // Simple limiter implementation
+  limiter_threshold = 0.99; // -0.087 dB
+  
+  limiter_mode == 0 ? (
+    // Peak mode
+    peak_val = max(abs(processed_L), abs(processed_R));
+    peak_val > limiter_threshold ? (
+      reduction = limiter_threshold / peak_val;
+      processed_L *= reduction;
+      processed_R *= reduction;
+    );
+  ) : (
+    // True Peak mode (simplified oversampling)
+    // Store in buffer for basic oversampling simulation
+    limiter_buffer_L[limiter_pos] = processed_L;
+    limiter_buffer_R[limiter_pos] = processed_R;
+    limiter_pos = (limiter_pos + 1) % limiter_buffer_size;
+    
+    // Check for intersample peaks (simplified)
+    interp_L = (processed_L + limiter_buffer_L[(limiter_pos - 1 + limiter_buffer_size) % limiter_buffer_size]) * 0.5;
+    interp_R = (processed_R + limiter_buffer_R[(limiter_pos - 1 + limiter_buffer_size) % limiter_buffer_size]) * 0.5;
+    
+    true_peak = max(max(abs(processed_L), abs(processed_R)), max(abs(interp_L), abs(interp_R)));
+    
+    true_peak > limiter_threshold ? (
+      reduction = limiter_threshold / true_peak;
+      processed_L *= reduction;
+      processed_R *= reduction;
+    );
+  );
+);
+
+// Track gain reduction for display (always, even when limiter is off)
+gain_reduction_db = 20 * log(reduction) / LOG10;
+// Smooth display with faster attack, slower release
+reduction < 1.0 ? (
+  // Attack - fast when limiting
+  gain_reduction_display = min(gain_reduction_display * 0.8 + gain_reduction_db * 0.2, gain_reduction_db);
+) : (
+  // Release - slow decay when not limiting
+  gain_reduction_display *= 0.995;
+);
+
+// Ensure gain reduction is negative (for display purposes)
+gain_reduction_display = min(0, gain_reduction_display);
+
+// Apply smoothing to meter display values at the end
+input_level_smooth = input_level_smooth * meter_smooth_coeff + input_level_display * (1 - meter_smooth_coeff);
+processed_level_smooth = processed_level_smooth * meter_smooth_coeff + processed_level_display * (1 - meter_smooth_coeff);
+
+// Apply fade envelope for smooth start/stop
+spl0 = processed_L * fade_envelope;
+spl1 = processed_R * fade_envelope;
+
+@gfx 640 480
+// Clear background
+gfx_clear = 0x202020;
+
+// Display text info first
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_x = 10; gfx_y = 20;
+gfx_printf("Target Range: %.1f to %.1f dB", target_range_min, target_range_max);
+
+gfx_x = 10; gfx_y = 40;
+gfx_printf("Target Center: %.1f dB", target_center);
+
+gfx_x = 10; gfx_y = 60;
+gfx_printf("Output Level: %.1f dB", processed_level_display);
+
+// Vertical meters - properly centered in 640px window
+// Window width = 640, center = 320
+// Meter setup: Input(white) - space - Output(green) - space - GR(red)
+meter_width = 30; // Wider meters (was 20)
+meter_height = 320;
+meter_y = 90;
+
+// Input meter (white) - left of center  
+meter_x = 270; // Moved closer to center
+// Output meter (green) - right of center, closer spacing
+proc_meter_x = 320; // Closer spacing (was 360 apart, now 50)
+// GR meter (red) - closer to processed meter, thinner
+gr_meter_x = 360; // Moved closer (was 370)
+gr_meter_width = 6; // Thinner GR meter (was 10)
+
+// Use smoothed levels for display
+input_level_db = input_level_smooth;
+processed_level_db = processed_level_smooth;
+
+// Input Level Meter (White)
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_rect(meter_x, meter_y, meter_width, meter_height, 0); // Frame
+
+// Fill based on level (-60dB to 0dB range, with expanded scale for 0 to -20)
+// 0 dB at top, -60 dB at bottom
+function db_to_pixel(db_val) (
+  db_val >= -20 ? (
+    // Expanded scale for 0 to -20 dB (top 60% of meter)
+    pixel_pos = ((-db_val) / 20) * (meter_height * 0.6);
+  ) : (
+    // Compressed scale for -20 to -60 dB (bottom 40% of meter)
+    pixel_pos = meter_height * 0.6 + ((-db_val - 20) / 40) * (meter_height * 0.4);
+  );
+  max(0, min(meter_height, pixel_pos));
+);
+
+input_fill_height = db_to_pixel(input_level_db);
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_rect(meter_x + 1, meter_y + meter_height - input_fill_height, meter_width - 2, input_fill_height);
+
+// Label
+gfx_x = meter_x + 5; gfx_y = meter_y + meter_height + 10;
+gfx_printf("In");
+
+// Processed Level Meter (Green)
+gfx_r = 0; gfx_g = 1; gfx_b = 0;
+gfx_rect(proc_meter_x, meter_y, meter_width, meter_height, 0); // Frame
+
+// Fill based on level
+processed_fill_height = db_to_pixel(processed_level_db);
+gfx_r = 0; gfx_g = 1; gfx_b = 0;
+gfx_rect(proc_meter_x + 1, meter_y + meter_height - processed_fill_height, meter_width - 2, processed_fill_height);
+
+// Label
+gfx_x = proc_meter_x + 2; gfx_y = meter_y + meter_height + 10;
+gfx_printf("Out");
+
+// Gain Reduction Meter (Red, thin)
+gfx_r = 1; gfx_g = 0; gfx_b = 0;
+gfx_rect(gr_meter_x, meter_y, gr_meter_width, meter_height, 0); // Frame
+
+// Fill based on gain reduction (0 to -20 dB, from top down)
+gr_fill_height = ((-gain_reduction_display) / 20) * meter_height;
+gr_fill_height = max(0, min(meter_height, gr_fill_height));
+gfx_r = 1; gfx_g = 0; gfx_b = 0;
+gfx_rect(gr_meter_x + 1, meter_y + 1, gr_meter_width - 2, gr_fill_height);
+
+// Label
+gfx_x = gr_meter_x + 1; gfx_y = meter_y + meter_height + 10;
+gfx_printf("GR");
+
+// Target Range markers on both meters
+target_min_pos = meter_y + db_to_pixel(target_range_min);
+target_max_pos = meter_y + db_to_pixel(target_range_max);
+
+// Target range markers (Blue) - thick lines
+gfx_r = 0; gfx_g = 0.7; gfx_b = 1;
+// Draw multiple lines for thickness
+line_start = meter_x - 10;
+line_end = gr_meter_x + gr_meter_width + 5;
+gfx_line(line_start, target_min_pos - 1, line_end, target_min_pos - 1);
+gfx_line(line_start, target_min_pos, line_end, target_min_pos);
+gfx_line(line_start, target_min_pos + 1, line_end, target_min_pos + 1);
+gfx_line(line_start, target_max_pos - 1, line_end, target_max_pos - 1);
+gfx_line(line_start, target_max_pos, line_end, target_max_pos);
+gfx_line(line_start, target_max_pos + 1, line_end, target_max_pos + 1);
+
+// Target center line (Pink) - thick line
+target_center_pos = meter_y + db_to_pixel(target_center);
+gfx_r = 1; gfx_g = 0.4; gfx_b = 1;
+gfx_line(line_start, target_center_pos - 1, line_end, target_center_pos - 1);
+gfx_line(line_start, target_center_pos, line_end, target_center_pos);
+gfx_line(line_start, target_center_pos + 1, line_end, target_center_pos + 1);
+
+// Display target center value next to the pink line
+gfx_x = gr_meter_x + gr_meter_width + 10; gfx_y = target_center_pos - 8;
+gfx_printf("%.1f", target_center);
+
+// dB Scale
+gfx_r = 0.7; gfx_g = 0.7; gfx_b = 0.7;
+// Draw scale marks manually with expanded scale
+scale_pos = meter_y + db_to_pixel(0);
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("0");
+
+scale_pos = meter_y + db_to_pixel(-3);
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-3");
+
+scale_pos = meter_y + db_to_pixel(-6);
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-6");
+
+scale_pos = meter_y + db_to_pixel(-10);
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-10");
+
+scale_pos = meter_y + db_to_pixel(-15);
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-15");
+
+scale_pos = meter_y + db_to_pixel(-20);
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-20");
+
+scale_pos = meter_y + db_to_pixel(-40);
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-40");
+
+scale_pos = meter_y + db_to_pixel(-60);
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
+gfx_printf("-60");
+
+// Clean interface without numerical readouts
