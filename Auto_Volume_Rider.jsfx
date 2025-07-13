@@ -73,6 +73,10 @@ silence_counter = 0;
 silence_threshold = 0.00000001; // Very quiet threshold
 silence_samples_to_reset = 0.1 * srate; // 100ms of silence to reset
 
+// Track previous slider values to detect changes
+prev_target_min = -30;
+prev_target_max = -10;
+
 // K-weighting coefficients for LUFS (simplified version)
 k_weight_a = 1.53512485958697;
 k_weight_b = 2.69169618940638;
@@ -103,24 +107,37 @@ release_ms = slider5;
 attack_coeff = exp(-1000 / (attack_ms * srate));
 release_coeff = exp(-1000 / (release_ms * srate));
 
-// Ensure target_range_min <= target_range_max
+// Smart slider linking - detect which slider changed and move the other accordingly
 target_range_min = slider6;
 target_range_max = slider7;
 
-// Fix slider logic - min cannot be greater than max
-target_range_min > target_range_max ? (
-  target_range_min = target_range_max;
-  slider6 = target_range_min;
-  sliderchange(slider6);
-  startup_counter = max(startup_counter, 0.5 * srate); // Reset startup on change
-);
+// Check which slider changed
+min_changed = (target_range_min != prev_target_min);
+max_changed = (target_range_max != prev_target_max);
 
-target_range_max < target_range_min ? (
+min_changed && !max_changed && target_range_min > target_range_max ? (
+  // Min slider moved up past max - move max up with it
   target_range_max = target_range_min;
   slider7 = target_range_max;
   sliderchange(slider7);
-  startup_counter = max(startup_counter, 0.5 * srate); // Reset startup on change
+  startup_counter = max(startup_counter, 0.5 * srate);
+) : max_changed && !min_changed && target_range_max < target_range_min ? (
+  // Max slider moved down past min - move min down with it  
+  target_range_min = target_range_max;
+  slider6 = target_range_min;
+  sliderchange(slider6);
+  startup_counter = max(startup_counter, 0.5 * srate);
+) : target_range_min > target_range_max ? (
+  // Fallback - if both changed or other edge case
+  target_range_min = target_range_max;
+  slider6 = target_range_min;
+  sliderchange(slider6);
+  startup_counter = max(startup_counter, 0.5 * srate);
 );
+
+// Store current values for next comparison
+prev_target_min = target_range_min;
+prev_target_max = target_range_max;
 
 output_gain_linear = 10^(slider8/20);
 limiter_enable = slider9;
