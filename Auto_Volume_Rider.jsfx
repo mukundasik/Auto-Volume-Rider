@@ -270,10 +270,11 @@ processed_L *= output_gain_linear;
 processed_R *= output_gain_linear;
 
 // True Peak Limiter
+reduction = 1.0;  // Default no reduction
+
 limiter_enable ? (
   // Simple limiter implementation
   limiter_threshold = 0.99; // -0.087 dB
-  reduction = 1.0;
   
   limiter_mode == 0 ? (
     // Peak mode
@@ -302,13 +303,21 @@ limiter_enable ? (
       processed_R *= reduction;
     );
   );
-  
-  // Track gain reduction for display
-  gain_reduction_db = 20 * log(reduction) / LOG10;
-  gain_reduction_display = max(gain_reduction_display * 0.95, gain_reduction_db);
-) : (
-  gain_reduction_display *= 0.95; // Decay when limiter is off
 );
+
+// Track gain reduction for display (always, even when limiter is off)
+gain_reduction_db = 20 * log(reduction) / LOG10;
+// Smooth display with faster attack, slower release
+reduction < 1.0 ? (
+  // Attack - fast when limiting
+  gain_reduction_display = min(gain_reduction_display * 0.8 + gain_reduction_db * 0.2, gain_reduction_db);
+) : (
+  // Release - slow decay when not limiting
+  gain_reduction_display *= 0.995;
+);
+
+// Ensure gain reduction is negative (for display purposes)
+gain_reduction_display = min(0, gain_reduction_display);
 
 // Output
 spl0 = processed_L;
@@ -318,13 +327,9 @@ spl1 = processed_R;
 // Clear background
 gfx_clear = 0x202020;
 
-// Minimal status info
-gfx_r = 1; gfx_g = 1; gfx_b = 1;
-gfx_x = 10; gfx_y = 20;
-gfx_printf("Target Range: %.1f to %.1f dB", target_range_min, target_range_max);
-
-// Vertical meters - positioned in center
-meter_x = 300;
+// Vertical meters - centered in window
+// Center of window is 320, so meters are positioned around center
+meter_x = 290; // Input meter (left of center)
 meter_width = 20;
 meter_height = 350;
 meter_y = 60;
@@ -338,6 +343,7 @@ gfx_r = 1; gfx_g = 1; gfx_b = 1;
 gfx_rect(meter_x, meter_y, meter_width, meter_height, 0); // Frame
 
 // Fill based on level (-60dB to 0dB range, with expanded scale for 0 to -20)
+// 0 dB at top, -60 dB at bottom
 function db_to_pixel(db_val) (
   db_val >= -20 ? (
     // Expanded scale for 0 to -20 dB (top 60% of meter)
@@ -351,33 +357,33 @@ function db_to_pixel(db_val) (
 
 input_fill_height = db_to_pixel(input_level_db);
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
-gfx_rect(meter_x + 1, meter_y + meter_height - input_fill_height, meter_width - 2, input_fill_height);
+gfx_rect(meter_x + 1, meter_y + 1, meter_width - 2, input_fill_height);
 
 // Label
 gfx_x = meter_x - 5; gfx_y = meter_y + meter_height + 10;
 gfx_printf("In");
 
 // Processed Level Meter (Green)
-proc_meter_x = meter_x + 40;
+proc_meter_x = meter_x + 40; // Right of center (320 + 10 = 330)
 gfx_r = 0; gfx_g = 1; gfx_b = 0;
 gfx_rect(proc_meter_x, meter_y, meter_width, meter_height, 0); // Frame
 
 // Fill based on level
 processed_fill_height = db_to_pixel(processed_level_db);
 gfx_r = 0; gfx_g = 1; gfx_b = 0;
-gfx_rect(proc_meter_x + 1, meter_y + meter_height - processed_fill_height, meter_width - 2, processed_fill_height);
+gfx_rect(proc_meter_x + 1, meter_y + 1, meter_width - 2, processed_fill_height);
 
 // Label
 gfx_x = proc_meter_x - 5; gfx_y = meter_y + meter_height + 10;
 gfx_printf("Out");
 
 // Gain Reduction Meter (Red, thin)
-gr_meter_x = proc_meter_x + 40;
+gr_meter_x = proc_meter_x + 30; // Close to processed meter
 gr_meter_width = 8;
 gfx_r = 1; gfx_g = 0; gfx_b = 0;
 gfx_rect(gr_meter_x, meter_y, gr_meter_width, meter_height, 0); // Frame
 
-// Fill based on gain reduction (0 to -20 dB)
+// Fill based on gain reduction (0 to -20 dB, from top down)
 gr_fill_height = ((-gain_reduction_display) / 20) * meter_height;
 gr_fill_height = max(0, min(meter_height, gr_fill_height));
 gfx_r = 1; gfx_g = 0; gfx_b = 0;
@@ -388,8 +394,8 @@ gfx_x = gr_meter_x - 5; gfx_y = meter_y + meter_height + 10;
 gfx_printf("GR");
 
 // Target Range markers on both meters
-target_min_pos = meter_y + meter_height - db_to_pixel(target_range_min);
-target_max_pos = meter_y + meter_height - db_to_pixel(target_range_max);
+target_min_pos = meter_y + db_to_pixel(target_range_min);
+target_max_pos = meter_y + db_to_pixel(target_range_max);
 
 // Target range markers (Yellow)
 gfx_r = 1; gfx_g = 1; gfx_b = 0;
@@ -397,49 +403,49 @@ gfx_line(meter_x - 5, target_min_pos, proc_meter_x + meter_width + 5, target_min
 gfx_line(meter_x - 5, target_max_pos, proc_meter_x + meter_width + 5, target_max_pos);
 
 // Target center line (Red)
-target_center_pos = meter_y + meter_height - db_to_pixel(target_center);
+target_center_pos = meter_y + db_to_pixel(target_center);
 gfx_r = 1; gfx_g = 0; gfx_b = 0;
 gfx_line(meter_x - 5, target_center_pos, proc_meter_x + meter_width + 5, target_center_pos);
 
 // dB Scale
 gfx_r = 0.7; gfx_g = 0.7; gfx_b = 0.7;
 // Draw scale marks manually with expanded scale
-scale_pos = meter_y + meter_height - db_to_pixel(0);
+scale_pos = meter_y + db_to_pixel(0);
 gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
 gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
 gfx_printf("0");
 
-scale_pos = meter_y + meter_height - db_to_pixel(-3);
+scale_pos = meter_y + db_to_pixel(-3);
 gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
 gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
 gfx_printf("-3");
 
-scale_pos = meter_y + meter_height - db_to_pixel(-6);
+scale_pos = meter_y + db_to_pixel(-6);
 gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
 gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
 gfx_printf("-6");
 
-scale_pos = meter_y + meter_height - db_to_pixel(-10);
+scale_pos = meter_y + db_to_pixel(-10);
 gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
 gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
 gfx_printf("-10");
 
-scale_pos = meter_y + meter_height - db_to_pixel(-15);
+scale_pos = meter_y + db_to_pixel(-15);
 gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
 gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
 gfx_printf("-15");
 
-scale_pos = meter_y + meter_height - db_to_pixel(-20);
+scale_pos = meter_y + db_to_pixel(-20);
 gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
 gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
 gfx_printf("-20");
 
-scale_pos = meter_y + meter_height - db_to_pixel(-40);
+scale_pos = meter_y + db_to_pixel(-40);
 gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
 gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
 gfx_printf("-40");
 
-scale_pos = meter_y + meter_height - db_to_pixel(-60);
+scale_pos = meter_y + db_to_pixel(-60);
 gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
 gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
 gfx_printf("-60");
