@@ -5,11 +5,11 @@ changelog:Initial release
 
 slider1:0<-24,24,0.1>Input Gain (dB)
 slider2:0<0,3,1{Peak,LUFS Short,LUFS Momentary,RMS}>Mode
-slider3:-55<-60,0,0.1>Target Range Min (dB)
-slider4:-5<-60,0,0.1>Target Range Max (dB)
-slider5:0.1<0,5,0.01>Lookahead (sec)
-slider6:10<0.1,1000,0.1>Attack (ms)
-slider7:100<1,5000,1>Release (ms)
+slider3:0.1<0,5,0.01>Lookahead (sec)
+slider4:10<0.1,1000,0.1>Attack (ms)
+slider5:100<1,5000,1>Release (ms)
+slider6:-55<-60,0,0.1>Target Range Min (dB)
+slider7:-5<-60,0,0.1>Target Range Max (dB)
 slider8:0<-24,24,0.1>Output Gain (dB)
 slider9:1<0,1,1{Off,On}>Limiter Enable
 slider10:0<0,1,1{Peak,True Peak}>Limiter Mode
@@ -93,26 +93,32 @@ pdc_delay = lookahead_samples;
 @slider
 input_gain_linear = 10^(slider1/20);
 mode = slider2;
+lookahead_time = slider3;
+lookahead_samples = min(max_lookahead_samples, lookahead_time * srate);
+
+// Convert Attack/Release from milliseconds to coefficients
+attack_ms = slider4;
+release_ms = slider5;
+attack_coeff = exp(-1000 / (attack_ms * srate));
+release_coeff = exp(-1000 / (release_ms * srate));
 
 // Ensure target_range_min <= target_range_max
-target_range_min = slider3;
-target_range_max = slider4;
+target_range_min = slider6;
+target_range_max = slider7;
 
 // Fix slider logic - min cannot be greater than max
 target_range_min > target_range_max ? (
   target_range_min = target_range_max;
-  slider3 = target_range_min;
-  sliderchange(slider3);
+  slider6 = target_range_min;
+  sliderchange(slider6);
 );
 
 target_range_max < target_range_min ? (
   target_range_max = target_range_min;
-  slider4 = target_range_max;
-  sliderchange(slider4);
+  slider7 = target_range_max;
+  sliderchange(slider7);
 );
 
-lookahead_time = slider5;
-lookahead_samples = min(max_lookahead_samples, lookahead_time * srate);
 output_gain_linear = 10^(slider8/20);
 limiter_enable = slider9;
 limiter_mode = slider10;
@@ -125,12 +131,6 @@ mode != prev_mode ? (
   mode_change_counter = mode_stability_samples;
   prev_mode = mode;
 );
-
-// Convert Attack/Release from milliseconds to coefficients
-attack_ms = slider6;
-release_ms = slider7;
-attack_coeff = exp(-1000 / (attack_ms * srate));
-release_coeff = exp(-1000 / (release_ms * srate));
 
 @sample
 // Apply input gain
@@ -360,12 +360,20 @@ spl1 = processed_R;
 // Clear background
 gfx_clear = 0x202020;
 
-// Vertical meters - centered in window
-// Center of window is 320, so meters are positioned around center
-meter_x = 290; // Input meter (left of center)
+// Vertical meters - properly centered in 640px window
+// Window width = 640, center = 320
+// Meter setup: Input(white) - space - Output(green) - space - GR(red)
 meter_width = 20;
 meter_height = 350;
 meter_y = 60;
+
+// Input meter (white) - left of center  
+meter_x = 260;
+// Output meter (green) - right of center
+proc_meter_x = 320;
+// GR meter (red) - further right
+gr_meter_x = 360;
+gr_meter_width = 10;
 
 // Levels are already in dB from measure_level function
 input_level_db = input_level_display;
@@ -393,11 +401,10 @@ gfx_r = 1; gfx_g = 1; gfx_b = 1;
 gfx_rect(meter_x + 1, meter_y + 1, meter_width - 2, input_fill_height);
 
 // Label
-gfx_x = meter_x - 5; gfx_y = meter_y + meter_height + 10;
+gfx_x = meter_x + 5; gfx_y = meter_y + meter_height + 10;
 gfx_printf("In");
 
 // Processed Level Meter (Green)
-proc_meter_x = meter_x + 40; // Right of center (320 + 10 = 330)
 gfx_r = 0; gfx_g = 1; gfx_b = 0;
 gfx_rect(proc_meter_x, meter_y, meter_width, meter_height, 0); // Frame
 
@@ -407,12 +414,10 @@ gfx_r = 0; gfx_g = 1; gfx_b = 0;
 gfx_rect(proc_meter_x + 1, meter_y + 1, meter_width - 2, processed_fill_height);
 
 // Label
-gfx_x = proc_meter_x - 5; gfx_y = meter_y + meter_height + 10;
+gfx_x = proc_meter_x + 2; gfx_y = meter_y + meter_height + 10;
 gfx_printf("Out");
 
 // Gain Reduction Meter (Red, thin)
-gr_meter_x = proc_meter_x + 30; // Close to processed meter
-gr_meter_width = 8;
 gfx_r = 1; gfx_g = 0; gfx_b = 0;
 gfx_rect(gr_meter_x, meter_y, gr_meter_width, meter_height, 0); // Frame
 
@@ -423,7 +428,7 @@ gfx_r = 1; gfx_g = 0; gfx_b = 0;
 gfx_rect(gr_meter_x + 1, meter_y + 1, gr_meter_width - 2, gr_fill_height);
 
 // Label
-gfx_x = gr_meter_x - 5; gfx_y = meter_y + meter_height + 10;
+gfx_x = gr_meter_x + 1; gfx_y = meter_y + meter_height + 10;
 gfx_printf("GR");
 
 // Target Range markers on both meters
@@ -432,55 +437,55 @@ target_max_pos = meter_y + db_to_pixel(target_range_max);
 
 // Target range markers (Yellow)
 gfx_r = 1; gfx_g = 1; gfx_b = 0;
-gfx_line(meter_x - 5, target_min_pos, proc_meter_x + meter_width + 5, target_min_pos);
-gfx_line(meter_x - 5, target_max_pos, proc_meter_x + meter_width + 5, target_max_pos);
+gfx_line(meter_x - 10, target_min_pos, gr_meter_x + gr_meter_width + 5, target_min_pos);
+gfx_line(meter_x - 10, target_max_pos, gr_meter_x + gr_meter_width + 5, target_max_pos);
 
 // Target center line (Red)
 target_center_pos = meter_y + db_to_pixel(target_center);
 gfx_r = 1; gfx_g = 0; gfx_b = 0;
-gfx_line(meter_x - 5, target_center_pos, proc_meter_x + meter_width + 5, target_center_pos);
+gfx_line(meter_x - 10, target_center_pos, gr_meter_x + gr_meter_width + 5, target_center_pos);
 
 // dB Scale
 gfx_r = 0.7; gfx_g = 0.7; gfx_b = 0.7;
 // Draw scale marks manually with expanded scale
 scale_pos = meter_y + db_to_pixel(0);
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
 gfx_printf("0");
 
 scale_pos = meter_y + db_to_pixel(-3);
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
 gfx_printf("-3");
 
 scale_pos = meter_y + db_to_pixel(-6);
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
 gfx_printf("-6");
 
 scale_pos = meter_y + db_to_pixel(-10);
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
 gfx_printf("-10");
 
 scale_pos = meter_y + db_to_pixel(-15);
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
 gfx_printf("-15");
 
 scale_pos = meter_y + db_to_pixel(-20);
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
 gfx_printf("-20");
 
 scale_pos = meter_y + db_to_pixel(-40);
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
 gfx_printf("-40");
 
 scale_pos = meter_y + db_to_pixel(-60);
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_line(meter_x - 25, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 45; gfx_y = scale_pos - 5;
 gfx_printf("-60");
 
 // Clean interface without numerical readouts
