@@ -62,6 +62,11 @@ target_gain = 1.0;
 attack_coeff = 0.999;
 release_coeff = 0.999;
 
+// Mode switching stability
+prev_mode = 0;
+mode_change_counter = 0;
+mode_stability_samples = 0.5 * srate; // 500ms to stabilize
+
 // K-weighting coefficients for LUFS (simplified version)
 k_weight_a = 1.53512485958697;
 k_weight_b = 2.69169618940638;
@@ -73,6 +78,12 @@ limiter_buffer_R = limiter_buffer_L + limiter_buffer_size;
 limiter_pos = 0;
 limiter_gain = 1.0;
 limiter_envelope = 0.0;
+gain_reduction_display = 0.0;
+
+// Set initial PDC (Plugin Delay Compensation)
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+pdc_delay = lookahead_samples;
 
 @slider
 input_gain_linear = 10^(slider1/20);
@@ -101,6 +112,15 @@ output_gain_linear = 10^(slider8/20);
 limiter_enable = slider9;
 limiter_mode = slider10;
 
+// Update PDC when lookahead changes
+pdc_delay = lookahead_samples;
+
+// Check for mode change
+mode != prev_mode ? (
+  mode_change_counter = mode_stability_samples;
+  prev_mode = mode;
+);
+
 // Convert Attack/Release from milliseconds to coefficients
 attack_ms = slider6;
 release_ms = slider7;
@@ -112,8 +132,33 @@ release_coeff = exp(-1000 / (release_ms * srate));
 spl0 *= input_gain_linear;
 spl1 *= input_gain_linear;
 
-// Store input level for display
-input_level_display = max(abs(spl0), abs(spl1));
+// Function to measure level in current mode
+function measure_level(L, R, measurement_mode) (
+  measurement_mode == 0 ? (
+    // Peak mode
+    peak_val = max(abs(L), abs(R));
+    peak_val > 0 ? 20 * log(peak_val) / LOG10 : -96;
+  ) : measurement_mode == 1 ? (
+    // LUFS Short - simplified for display
+    weighted_L = L * k_weight_a;
+    weighted_R = R * k_weight_a;
+    mean_square = (weighted_L * weighted_L + weighted_R * weighted_R) / 2;
+    mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+  ) : measurement_mode == 2 ? (
+    // LUFS Momentary - simplified for display
+    weighted_L = L * k_weight_a;
+    weighted_R = R * k_weight_a;
+    mean_square = (weighted_L * weighted_L + weighted_R * weighted_R) / 2;
+    mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+  ) : (
+    // RMS mode
+    rms_val = sqrt((L * L + R * R) / 2);
+    rms_val > 0 ? 20 * log(rms_val) / LOG10 : -96;
+  );
+);
+
+// Store input level for display using current mode
+input_level_display = measure_level(spl0, spl1, mode);
 
 // Write to lookahead buffer
 lookahead_buffer_L[write_pos] = spl0;
@@ -129,6 +174,13 @@ write_pos = (write_pos + 1) % max_lookahead_samples;
 // Measure current signal level
 current_level = 0;
 
+// Handle mode switching stability
+mode_change_counter > 0 ? (
+  mode_change_counter -= 1;
+  // Keep previous gain during stabilization
+  target_gain = current_gain;
+) : (
+  
 mode == 0 ? (
   // Peak mode - improved implementation
   peak_L = abs(spl0);
@@ -195,6 +247,8 @@ target_gain = 10^(level_diff/20);
 // Limit gain to reasonable bounds
 target_gain = max(0.01, min(100, target_gain));
 
+); // Close mode stabilization bracket
+
 // Apply Attack/Release for smoothing
 target_gain > current_gain ? (
   // Attack - fast reaction to level increase
@@ -208,8 +262,8 @@ target_gain > current_gain ? (
 processed_L = delayed_L * current_gain;
 processed_R = delayed_R * current_gain;
 
-// Store processed level for display
-processed_level_display = max(abs(processed_L), abs(processed_R));
+// Store processed level for display using current mode
+processed_level_display = measure_level(processed_L, processed_R, mode);
 
 // Apply output gain
 processed_L *= output_gain_linear;
@@ -219,6 +273,7 @@ processed_R *= output_gain_linear;
 limiter_enable ? (
   // Simple limiter implementation
   limiter_threshold = 0.99; // -0.087 dB
+  reduction = 1.0;
   
   limiter_mode == 0 ? (
     // Peak mode
@@ -247,6 +302,12 @@ limiter_enable ? (
       processed_R *= reduction;
     );
   );
+  
+  // Track gain reduction for display
+  gain_reduction_db = 20 * log(reduction) / LOG10;
+  gain_reduction_display = max(gain_reduction_display * 0.95, gain_reduction_db);
+) : (
+  gain_reduction_display *= 0.95; // Decay when limiter is off
 );
 
 // Output
@@ -257,48 +318,38 @@ spl1 = processed_R;
 // Clear background
 gfx_clear = 0x202020;
 
-// Title
+// Minimal status info
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
-gfx_x = 10; gfx_y = 10;
-gfx_printf("Auto Volume Rider");
-
-// Status info
-gfx_x = 10; gfx_y = 30;
-gfx_printf("Mode: %s", mode == 0 ? "Peak" : mode == 1 ? "LUFS Short" : mode == 2 ? "LUFS Momentary" : "RMS");
-
-gfx_x = 10; gfx_y = 50;
+gfx_x = 10; gfx_y = 20;
 gfx_printf("Target Range: %.1f to %.1f dB", target_range_min, target_range_max);
 
-gfx_x = 10; gfx_y = 70;
-gfx_printf("Current Gain: %.2f (%.1f dB)", current_gain, 20 * log(current_gain) / LOG10);
-
-gfx_x = 10; gfx_y = 90;
-gfx_printf("Limiter: %s (%s)", limiter_enable ? "ON" : "OFF", limiter_mode ? "True Peak" : "Peak");
-
-// Debug info
-gfx_x = 10; gfx_y = 110;
-gfx_printf("Measured Level: %.1f dB", current_level);
-
-gfx_x = 10; gfx_y = 130;
-gfx_printf("Target Center: %.1f dB", target_center);
-
 // Vertical meters - positioned in center
-meter_x = 280;
+meter_x = 300;
 meter_width = 20;
-meter_height = 280;
-meter_y = 150;
+meter_height = 350;
+meter_y = 60;
 
-// Convert levels to display values
-input_level_db = input_level_display > 0 ? 20 * log(input_level_display) / LOG10 : -96;
-processed_level_db = processed_level_display > 0 ? 20 * log(processed_level_display) / LOG10 : -96;
+// Levels are already in dB from measure_level function
+input_level_db = input_level_display;
+processed_level_db = processed_level_display;
 
 // Input Level Meter (White)
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
 gfx_rect(meter_x, meter_y, meter_width, meter_height, 0); // Frame
 
-// Fill based on level (-60dB to 0dB range)
-input_fill_height = ((input_level_db + 60) / 60) * meter_height;
-input_fill_height = max(0, min(meter_height, input_fill_height));
+// Fill based on level (-60dB to 0dB range, with expanded scale for 0 to -20)
+function db_to_pixel(db_val) (
+  db_val >= -20 ? (
+    // Expanded scale for 0 to -20 dB (top 60% of meter)
+    pixel_pos = ((-db_val) / 20) * (meter_height * 0.6);
+  ) : (
+    // Compressed scale for -20 to -60 dB (bottom 40% of meter)
+    pixel_pos = meter_height * 0.6 + ((-db_val - 20) / 40) * (meter_height * 0.4);
+  );
+  max(0, min(meter_height, pixel_pos));
+);
+
+input_fill_height = db_to_pixel(input_level_db);
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
 gfx_rect(meter_x + 1, meter_y + meter_height - input_fill_height, meter_width - 2, input_fill_height);
 
@@ -312,8 +363,7 @@ gfx_r = 0; gfx_g = 1; gfx_b = 0;
 gfx_rect(proc_meter_x, meter_y, meter_width, meter_height, 0); // Frame
 
 // Fill based on level
-processed_fill_height = ((processed_level_db + 60) / 60) * meter_height;
-processed_fill_height = max(0, min(meter_height, processed_fill_height));
+processed_fill_height = db_to_pixel(processed_level_db);
 gfx_r = 0; gfx_g = 1; gfx_b = 0;
 gfx_rect(proc_meter_x + 1, meter_y + meter_height - processed_fill_height, meter_width - 2, processed_fill_height);
 
@@ -321,67 +371,77 @@ gfx_rect(proc_meter_x + 1, meter_y + meter_height - processed_fill_height, meter
 gfx_x = proc_meter_x - 5; gfx_y = meter_y + meter_height + 10;
 gfx_printf("Out");
 
+// Gain Reduction Meter (Red, thin)
+gr_meter_x = proc_meter_x + 40;
+gr_meter_width = 8;
+gfx_r = 1; gfx_g = 0; gfx_b = 0;
+gfx_rect(gr_meter_x, meter_y, gr_meter_width, meter_height, 0); // Frame
+
+// Fill based on gain reduction (0 to -20 dB)
+gr_fill_height = ((-gain_reduction_display) / 20) * meter_height;
+gr_fill_height = max(0, min(meter_height, gr_fill_height));
+gfx_r = 1; gfx_g = 0; gfx_b = 0;
+gfx_rect(gr_meter_x + 1, meter_y + 1, gr_meter_width - 2, gr_fill_height);
+
+// Label
+gfx_x = gr_meter_x - 5; gfx_y = meter_y + meter_height + 10;
+gfx_printf("GR");
+
 // Target Range markers on both meters
-target_min_pos = meter_y + meter_height - ((target_range_min + 60) / 60) * meter_height;
-target_max_pos = meter_y + meter_height - ((target_range_max + 60) / 60) * meter_height;
-target_min_pos = max(meter_y, min(meter_y + meter_height, target_min_pos));
-target_max_pos = max(meter_y, min(meter_y + meter_height, target_max_pos));
+target_min_pos = meter_y + meter_height - db_to_pixel(target_range_min);
+target_max_pos = meter_y + meter_height - db_to_pixel(target_range_max);
 
 // Target range markers (Yellow)
 gfx_r = 1; gfx_g = 1; gfx_b = 0;
-gfx_line(meter_x - 5, target_min_pos, meter_x + meter_width + 5, target_min_pos);
-gfx_line(meter_x - 5, target_max_pos, meter_x + meter_width + 5, target_max_pos);
-gfx_line(proc_meter_x - 5, target_min_pos, proc_meter_x + meter_width + 5, target_min_pos);
-gfx_line(proc_meter_x - 5, target_max_pos, proc_meter_x + meter_width + 5, target_max_pos);
+gfx_line(meter_x - 5, target_min_pos, proc_meter_x + meter_width + 5, target_min_pos);
+gfx_line(meter_x - 5, target_max_pos, proc_meter_x + meter_width + 5, target_max_pos);
 
 // Target center line (Red)
-target_center_pos = meter_y + meter_height - ((target_center + 60) / 60) * meter_height;
-target_center_pos = max(meter_y, min(meter_y + meter_height, target_center_pos));
+target_center_pos = meter_y + meter_height - db_to_pixel(target_center);
 gfx_r = 1; gfx_g = 0; gfx_b = 0;
 gfx_line(meter_x - 5, target_center_pos, proc_meter_x + meter_width + 5, target_center_pos);
 
 // dB Scale
 gfx_r = 0.7; gfx_g = 0.7; gfx_b = 0.7;
-// Draw scale marks manually
-scale_pos = meter_y + meter_height - ((-60 + 60) / 60) * meter_height;
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
-gfx_printf("-60");
-
-scale_pos = meter_y + meter_height - ((-40 + 60) / 60) * meter_height;
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
-gfx_printf("-40");
-
-scale_pos = meter_y + meter_height - ((-20 + 60) / 60) * meter_height;
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
-gfx_printf("-20");
-
-scale_pos = meter_y + meter_height - ((-10 + 60) / 60) * meter_height;
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
-gfx_printf("-10");
-
-scale_pos = meter_y + meter_height - ((-6 + 60) / 60) * meter_height;
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
-gfx_printf("-6");
-
-scale_pos = meter_y + meter_height - ((-3 + 60) / 60) * meter_height;
-gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
-gfx_printf("-3");
-
-scale_pos = meter_y + meter_height - ((0 + 60) / 60) * meter_height;
+// Draw scale marks manually with expanded scale
+scale_pos = meter_y + meter_height - db_to_pixel(0);
 gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
 gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
 gfx_printf("0");
 
-// Numerical readouts
-gfx_r = 1; gfx_g = 1; gfx_b = 1;
-gfx_x = 10; gfx_y = 430;
-gfx_printf("Input Level: %.1f dB", input_level_db);
+scale_pos = meter_y + meter_height - db_to_pixel(-3);
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-3");
 
-gfx_x = 10; gfx_y = 450;
-gfx_printf("Processed Level: %.1f dB", processed_level_db);
+scale_pos = meter_y + meter_height - db_to_pixel(-6);
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-6");
+
+scale_pos = meter_y + meter_height - db_to_pixel(-10);
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-10");
+
+scale_pos = meter_y + meter_height - db_to_pixel(-15);
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-15");
+
+scale_pos = meter_y + meter_height - db_to_pixel(-20);
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-20");
+
+scale_pos = meter_y + meter_height - db_to_pixel(-40);
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-40");
+
+scale_pos = meter_y + meter_height - db_to_pixel(-60);
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-60");
+
+// Clean interface without numerical readouts
