@@ -5,8 +5,8 @@ changelog:Initial release
 
 slider1:0<-24,24,0.1>Input Gain (dB)
 slider2:0<0,3,1{Peak,LUFS Short,LUFS Momentary,RMS}>Mode
-slider3:-30<-60,0,0.1>Target Range Min (dB)
-slider4:-18<-60,0,0.1>Target Range Max (dB)
+slider3:-25<-60,0,0.1>Target Range Min (dB)
+slider4:-6<-60,0,0.1>Target Range Max (dB)
 slider5:0.1<0,5,0.01>Lookahead (sec)
 slider6:10<0.1,1000,0.1>Attack (ms)
 slider7:100<1,5000,1>Release (ms)
@@ -77,8 +77,24 @@ limiter_envelope = 0.0;
 @slider
 input_gain_linear = 10^(slider1/20);
 mode = slider2;
+
+// Ensure target_range_min <= target_range_max
 target_range_min = slider3;
 target_range_max = slider4;
+
+// Fix slider logic - min cannot be greater than max
+target_range_min > target_range_max ? (
+  target_range_min = target_range_max;
+  slider3 = target_range_min;
+  sliderchange(slider3);
+);
+
+target_range_max < target_range_min ? (
+  target_range_max = target_range_min;
+  slider4 = target_range_max;
+  sliderchange(slider4);
+);
+
 lookahead_time = slider5;
 lookahead_samples = min(max_lookahead_samples, lookahead_time * srate);
 output_gain_linear = 10^(slider8/20);
@@ -114,11 +130,13 @@ write_pos = (write_pos + 1) % max_lookahead_samples;
 current_level = 0;
 
 mode == 0 ? (
-  // Peak mode
+  // Peak mode - improved implementation
   peak_L = abs(spl0);
   peak_R = abs(spl1);
-  peak_level = max(peak_L, peak_R);
-  peak_level = max(peak_level * 0.999, max(peak_L, peak_R));
+  instant_peak = max(peak_L, peak_R);
+  // Use slower decay for peak hold
+  peak_decay = exp(-1 / (0.1 * srate)); // 100ms decay
+  peak_level = max(instant_peak, peak_level * peak_decay);
   current_level = peak_level > 0 ? 20 * log(peak_level) / LOG10 : -96;
 ) : mode == 1 ? (
   // LUFS Short (400ms)
@@ -158,9 +176,10 @@ mode == 0 ? (
   mean_square = (lufs_long_sum_L + lufs_long_sum_R) / (lufs_long_size * 2);
   current_level = mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
 ) : (
-  // RMS mode
-  rms_sum_L = rms_sum_L * 0.999 + spl0 * spl0;
-  rms_sum_R = rms_sum_R * 0.999 + spl1 * spl1;
+  // RMS mode - improved implementation
+  rms_coeff = exp(-1 / (0.3 * srate)); // 300ms time constant
+  rms_sum_L = rms_sum_L * rms_coeff + spl0 * spl0 * (1 - rms_coeff);
+  rms_sum_R = rms_sum_R * rms_coeff + spl1 * spl1 * (1 - rms_coeff);
   rms_level = sqrt((rms_sum_L + rms_sum_R) / 2);
   current_level = rms_level > 0 ? 20 * log(rms_level) / LOG10 : -96;
 );
@@ -256,11 +275,18 @@ gfx_printf("Current Gain: %.2f (%.1f dB)", current_gain, 20 * log(current_gain) 
 gfx_x = 10; gfx_y = 90;
 gfx_printf("Limiter: %s (%s)", limiter_enable ? "ON" : "OFF", limiter_mode ? "True Peak" : "Peak");
 
+// Debug info
+gfx_x = 10; gfx_y = 110;
+gfx_printf("Measured Level: %.1f dB", current_level);
+
+gfx_x = 10; gfx_y = 130;
+gfx_printf("Target Center: %.1f dB", target_center);
+
 // Vertical meters - positioned in center
 meter_x = 280;
 meter_width = 20;
-meter_height = 300;
-meter_y = 120;
+meter_height = 280;
+meter_y = 150;
 
 // Convert levels to display values
 input_level_db = input_level_display > 0 ? 20 * log(input_level_display) / LOG10 : -96;
@@ -277,8 +303,8 @@ gfx_r = 1; gfx_g = 1; gfx_b = 1;
 gfx_rect(meter_x + 1, meter_y + meter_height - input_fill_height, meter_width - 2, input_fill_height);
 
 // Label
-gfx_x = meter_x - 10; gfx_y = meter_y + meter_height + 10;
-gfx_printf("Input");
+gfx_x = meter_x - 5; gfx_y = meter_y + meter_height + 10;
+gfx_printf("In");
 
 // Processed Level Meter (Green)
 proc_meter_x = meter_x + 40;
@@ -292,8 +318,8 @@ gfx_r = 0; gfx_g = 1; gfx_b = 0;
 gfx_rect(proc_meter_x + 1, meter_y + meter_height - processed_fill_height, meter_width - 2, processed_fill_height);
 
 // Label
-gfx_x = proc_meter_x - 15; gfx_y = meter_y + meter_height + 10;
-gfx_printf("Processed");
+gfx_x = proc_meter_x - 5; gfx_y = meter_y + meter_height + 10;
+gfx_printf("Out");
 
 // Target Range markers on both meters
 target_min_pos = meter_y + meter_height - ((target_range_min + 60) / 60) * meter_height;
