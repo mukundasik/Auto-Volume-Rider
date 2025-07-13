@@ -1,0 +1,201 @@
+desc:Auto Volume Rider
+author:AI Assistant
+version:1.0
+changelog:Initial release
+about:
+  # Auto Volume Rider
+  
+  Автоматический регулятор громкости с поддержкой различных методов измерения уровня сигнала.
+  
+  ## Параметры:
+  - Input Gain: Предварительное усиление входного сигнала
+  - Mode: Режим измерения (Peak, LUFS S, LUFS M, RMS)
+  - Range Min/Max: Диапазон целевой громкости
+  - Target Output: Целевая выходная громкость
+  - Lookahead: Время опережения для более точной обработки
+
+slider1:0<-24,24,0.1>Input Gain (dB)
+slider2:0<0,3,1{Peak,LUFS Short,LUFS Momentary,RMS}>Mode
+slider3:-30<-60,0,0.1>Range Minimum (dB)
+slider4:-6<-60,0,0.1>Range Maximum (dB)
+slider5:-18<-60,0,0.1>Target Output Volume (dB)
+slider6:0.1<0,5,0.01>Lookahead (sec)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+// Константы
+PI = 3.14159265359;
+LOG10 = 2.30258509299;
+SQRT2 = 1.41421356237;
+
+// Буферы для lookahead
+max_lookahead_samples = 5 * srate;
+lookahead_buffer_L = 0;
+lookahead_buffer_R = max_lookahead_samples;
+write_pos = 0;
+
+// Переменные для измерения уровня
+peak_level = 0;
+rms_sum_L = 0;
+rms_sum_R = 0;
+rms_count = 0;
+rms_window = 0.1 * srate; // 100ms окно для RMS
+
+// LUFS переменные
+lufs_buffer_size = 0.4 * srate; // 400ms для LUFS Short
+lufs_buffer_L = max_lookahead_samples * 2;
+lufs_buffer_R = max_lookahead_samples * 2 + lufs_buffer_size;
+lufs_write_pos = 0;
+lufs_sum_L = 0;
+lufs_sum_R = 0;
+
+// Длинное окно для LUFS Momentary (3 секунды)
+lufs_long_size = 3 * srate;
+lufs_long_L = max_lookahead_samples * 2 + lufs_buffer_size * 2;
+lufs_long_R = max_lookahead_samples * 2 + lufs_buffer_size * 2 + lufs_long_size;
+lufs_long_pos = 0;
+lufs_long_sum_L = 0;
+lufs_long_sum_R = 0;
+
+// Сглаживание усиления
+current_gain = 1.0;
+target_gain = 1.0;
+gain_smooth = 0.999; // Фактор сглаживания
+
+// K-weighting коэффициенты для LUFS (упрощенная версия)
+k_weight_a = 1.53512485958697;
+k_weight_b = 2.69169618940638;
+
+@slider
+input_gain_linear = 10^(slider1/20);
+mode = slider2;
+range_min = slider3;
+range_max = slider4;
+target_output = slider5;
+lookahead_time = slider6;
+lookahead_samples = min(max_lookahead_samples, lookahead_time * srate);
+
+@sample
+// Применяем входное усиление
+spl0 *= input_gain_linear;
+spl1 *= input_gain_linear;
+
+// Записываем в lookahead буфер
+lookahead_buffer_L[write_pos] = spl0;
+lookahead_buffer_R[write_pos] = spl1;
+
+// Читаем из lookahead буфера
+read_pos = (write_pos - lookahead_samples + max_lookahead_samples) % max_lookahead_samples;
+delayed_L = lookahead_buffer_L[read_pos];
+delayed_R = lookahead_buffer_R[read_pos];
+
+write_pos = (write_pos + 1) % max_lookahead_samples;
+
+// Измеряем уровень текущего сигнала
+current_level = 0;
+
+mode == 0 ? (
+  // Peak mode
+  peak_L = abs(spl0);
+  peak_R = abs(spl1);
+  peak_level = max(peak_L, peak_R);
+  peak_level = max(peak_level * 0.999, max(peak_L, peak_R));
+  current_level = peak_level > 0 ? 20 * log(peak_level) / LOG10 : -96;
+) : mode == 1 ? (
+  // LUFS Short (400ms)
+  // K-weighting (упрощенная версия)
+  weighted_L = spl0 * k_weight_a;
+  weighted_R = spl1 * k_weight_a;
+  
+  // Обновляем буфер
+  old_L = lufs_buffer_L[lufs_write_pos];
+  old_R = lufs_buffer_R[lufs_write_pos];
+  lufs_buffer_L[lufs_write_pos] = weighted_L * weighted_L;
+  lufs_buffer_R[lufs_write_pos] = weighted_R * weighted_R;
+  
+  // Обновляем сумму
+  lufs_sum_L = lufs_sum_L - old_L + lufs_buffer_L[lufs_write_pos];
+  lufs_sum_R = lufs_sum_R - old_R + lufs_buffer_R[lufs_write_pos];
+  
+  lufs_write_pos = (lufs_write_pos + 1) % lufs_buffer_size;
+  
+  mean_square = (lufs_sum_L + lufs_sum_R) / (lufs_buffer_size * 2);
+  current_level = mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+) : mode == 2 ? (
+  // LUFS Momentary (3s)
+  weighted_L = spl0 * k_weight_a;
+  weighted_R = spl1 * k_weight_a;
+  
+  old_L = lufs_long_L[lufs_long_pos];
+  old_R = lufs_long_R[lufs_long_pos];
+  lufs_long_L[lufs_long_pos] = weighted_L * weighted_L;
+  lufs_long_R[lufs_long_pos] = weighted_R * weighted_R;
+  
+  lufs_long_sum_L = lufs_long_sum_L - old_L + lufs_long_L[lufs_long_pos];
+  lufs_long_sum_R = lufs_long_sum_R - old_R + lufs_long_R[lufs_long_pos];
+  
+  lufs_long_pos = (lufs_long_pos + 1) % lufs_long_size;
+  
+  mean_square = (lufs_long_sum_L + lufs_long_sum_R) / (lufs_long_size * 2);
+  current_level = mean_square > 0 ? -0.691 + 10 * log(mean_square) / LOG10 : -96;
+) : (
+  // RMS mode
+  rms_sum_L = rms_sum_L * 0.999 + spl0 * spl0;
+  rms_sum_R = rms_sum_R * 0.999 + spl1 * spl1;
+  rms_level = sqrt((rms_sum_L + rms_sum_R) / 2);
+  current_level = rms_level > 0 ? 20 * log(rms_level) / LOG10 : -96;
+);
+
+// Ограничиваем уровень диапазоном
+current_level = max(range_min, min(range_max, current_level));
+
+// Вычисляем необходимое усиление
+level_diff = target_output - current_level;
+target_gain = 10^(level_diff/20);
+
+// Ограничиваем усиление разумными пределами
+target_gain = max(0.1, min(10, target_gain));
+
+// Сглаживаем изменения усиления
+current_gain = current_gain * gain_smooth + target_gain * (1 - gain_smooth);
+
+// Применяем усиление к задержанному сигналу
+spl0 = delayed_L * current_gain;
+spl1 = delayed_R * current_gain;
+
+@gfx 640 480
+// Простой графический интерфейс
+gfx_clear = 0x000000;
+
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_x = 10; gfx_y = 10;
+gfx_printf("Auto Volume Rider");
+
+gfx_x = 10; gfx_y = 40;
+gfx_printf("Input Level: %.1f dB", current_level);
+
+gfx_x = 10; gfx_y = 60;
+gfx_printf("Current Gain: %.2f (%.1f dB)", current_gain, 20 * log(current_gain) / LOG10);
+
+gfx_x = 10; gfx_y = 80;
+gfx_printf("Target: %.1f dB", target_output);
+
+// Индикатор уровня
+gfx_r = 0; gfx_g = 1; gfx_b = 0;
+level_bar_width = (current_level + 60) / 60 * 200;
+level_bar_width = max(0, min(200, level_bar_width));
+gfx_rect(10, 100, level_bar_width, 20);
+
+// Рамка индикатора
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_rect(10, 100, 200, 20, 0);
+
+// Целевая отметка
+target_pos = (target_output + 60) / 60 * 200;
+target_pos = max(0, min(200, target_pos));
+gfx_r = 1; gfx_g = 0; gfx_b = 0;
+gfx_line(10 + target_pos, 95, 10 + target_pos, 125);
