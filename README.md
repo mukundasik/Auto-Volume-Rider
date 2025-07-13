@@ -119,9 +119,9 @@
 - Limiter: True Peak включен
 
 **Настройки "из коробки" (дефолт):**
-- Target Range: -55 до -5 дБ (широкий диапазон, минимальное влияние)
+- Target Range: -30 до -10 дБ (безопасный диапазон, центр -20 дБ)
 - Mode: Peak
-- Attack: 10мс, Release: 100мс
+- Attack: 50мс, Release: 500мс (плавная работа)
 - Lookahead: 0.1сек
 - Output Gain: 0дБ
 - Limiter: Включен (True Peak)
