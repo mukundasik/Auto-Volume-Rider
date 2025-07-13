@@ -2,19 +2,6 @@ desc:Auto Volume Rider
 author:AI Assistant
 version:1.0
 changelog:Initial release
-about:
-  # Auto Volume Rider
-  
-  Автоматический регулятор громкости с поддержкой различных методов измерения уровня сигнала.
-  
-  ## Параметры:
-  - Input Gain: Предварительное усиление входного сигнала
-  - Mode: Режим измерения (Peak, LUFS S, LUFS M, RMS)
-  - Range Min/Max: Границы для входного сигнала (компрессия/экспандинг)
-  - Target Output: Целевая выходная громкость
-  - Lookahead: Время опережения для более точной обработки
-  - Attack: Скорость реакции на повышение уровня (мс)
-  - Release: Скорость реакции на понижение уровня (мс)
 
 slider1:0<-24,24,0.1>Input Gain (dB)
 slider2:0<0,3,1{Peak,LUFS Short,LUFS Momentary,RMS}>Mode
@@ -31,33 +18,33 @@ out_pin:left output
 out_pin:right output
 
 @init
-// Константы
+// Constants
 PI = 3.14159265359;
 LOG10 = 2.30258509299;
 SQRT2 = 1.41421356237;
 
-// Буферы для lookahead
+// Lookahead buffers
 max_lookahead_samples = 5 * srate;
 lookahead_buffer_L = 0;
 lookahead_buffer_R = max_lookahead_samples;
 write_pos = 0;
 
-// Переменные для измерения уровня
+// Level measurement variables
 peak_level = 0;
 rms_sum_L = 0;
 rms_sum_R = 0;
 rms_count = 0;
-rms_window = 0.1 * srate; // 100ms окно для RMS
+rms_window = 0.1 * srate; // 100ms window for RMS
 
-// LUFS переменные
-lufs_buffer_size = 0.4 * srate; // 400ms для LUFS Short
+// LUFS variables
+lufs_buffer_size = 0.4 * srate; // 400ms for LUFS Short
 lufs_buffer_L = max_lookahead_samples * 2;
 lufs_buffer_R = max_lookahead_samples * 2 + lufs_buffer_size;
 lufs_write_pos = 0;
 lufs_sum_L = 0;
 lufs_sum_R = 0;
 
-// Длинное окно для LUFS Momentary (3 секунды)
+// Long window for LUFS Momentary (3 seconds)
 lufs_long_size = 3 * srate;
 lufs_long_L = max_lookahead_samples * 2 + lufs_buffer_size * 2;
 lufs_long_R = max_lookahead_samples * 2 + lufs_buffer_size * 2 + lufs_long_size;
@@ -65,15 +52,15 @@ lufs_long_pos = 0;
 lufs_long_sum_L = 0;
 lufs_long_sum_R = 0;
 
-// Сглаживание усиления
+// Gain smoothing
 current_gain = 1.0;
 target_gain = 1.0;
 
-// Attack/Release параметры
+// Attack/Release parameters
 attack_coeff = 0.999;
 release_coeff = 0.999;
 
-// K-weighting коэффициенты для LUFS (упрощенная версия)
+// K-weighting coefficients for LUFS (simplified version)
 k_weight_a = 1.53512485958697;
 k_weight_b = 2.69169618940638;
 
@@ -86,29 +73,29 @@ target_output = slider5;
 lookahead_time = slider6;
 lookahead_samples = min(max_lookahead_samples, lookahead_time * srate);
 
-// Конвертируем Attack/Release из миллисекунд в коэффициенты
+// Convert Attack/Release from milliseconds to coefficients
 attack_ms = slider7;
 release_ms = slider8;
 attack_coeff = exp(-1000 / (attack_ms * srate));
 release_coeff = exp(-1000 / (release_ms * srate));
 
 @sample
-// Применяем входное усиление
+// Apply input gain
 spl0 *= input_gain_linear;
 spl1 *= input_gain_linear;
 
-// Записываем в lookahead буфер
+// Write to lookahead buffer
 lookahead_buffer_L[write_pos] = spl0;
 lookahead_buffer_R[write_pos] = spl1;
 
-// Читаем из lookahead буфера
+// Read from lookahead buffer
 read_pos = (write_pos - lookahead_samples + max_lookahead_samples) % max_lookahead_samples;
 delayed_L = lookahead_buffer_L[read_pos];
 delayed_R = lookahead_buffer_R[read_pos];
 
 write_pos = (write_pos + 1) % max_lookahead_samples;
 
-// Измеряем уровень текущего сигнала
+// Measure current signal level
 current_level = 0;
 
 mode == 0 ? (
@@ -120,17 +107,17 @@ mode == 0 ? (
   current_level = peak_level > 0 ? 20 * log(peak_level) / LOG10 : -96;
 ) : mode == 1 ? (
   // LUFS Short (400ms)
-  // K-weighting (упрощенная версия)
+  // K-weighting (simplified version)
   weighted_L = spl0 * k_weight_a;
   weighted_R = spl1 * k_weight_a;
   
-  // Обновляем буфер
+  // Update buffer
   old_L = lufs_buffer_L[lufs_write_pos];
   old_R = lufs_buffer_R[lufs_write_pos];
   lufs_buffer_L[lufs_write_pos] = weighted_L * weighted_L;
   lufs_buffer_R[lufs_write_pos] = weighted_R * weighted_R;
   
-  // Обновляем сумму
+  // Update sum
   lufs_sum_L = lufs_sum_L - old_L + lufs_buffer_L[lufs_write_pos];
   lufs_sum_R = lufs_sum_R - old_R + lufs_buffer_R[lufs_write_pos];
   
@@ -163,41 +150,41 @@ mode == 0 ? (
   current_level = rms_level > 0 ? 20 * log(rms_level) / LOG10 : -96;
 );
 
-// Применяем Range Minimum/Maximum как границы для входного сигнала
+// Apply Range Minimum/Maximum as input signal boundaries
 processed_level = current_level;
 
-// Если сигнал тише чем Range Minimum - подтягиваем до Range Minimum
+// If signal is quieter than Range Minimum - boost to Range Minimum
 processed_level < range_min ? (
   processed_level = range_min;
 );
 
-// Если сигнал громче чем Range Maximum - опускаем до Range Maximum  
+// If signal is louder than Range Maximum - reduce to Range Maximum  
 processed_level > range_max ? (
   processed_level = range_max;
 );
 
-// Теперь приводим к Target Output Volume
+// Now adjust to Target Output Volume
 level_diff = target_output - processed_level;
 target_gain = 10^(level_diff/20);
 
-// Ограничиваем усиление разумными пределами
+// Limit gain to reasonable bounds
 target_gain = max(0.01, min(100, target_gain));
 
-// Применяем Attack/Release для сглаживания
+// Apply Attack/Release for smoothing
 target_gain > current_gain ? (
-  // Attack - быстрая реакция на повышение уровня
+  // Attack - fast reaction to level increase
   current_gain = current_gain * attack_coeff + target_gain * (1 - attack_coeff);
 ) : (
-  // Release - медленная реакция на понижение уровня
+  // Release - slow reaction to level decrease
   current_gain = current_gain * release_coeff + target_gain * (1 - release_coeff);
 );
 
-// Применяем усиление к задержанному сигналу
+// Apply gain to delayed signal
 spl0 = delayed_L * current_gain;
 spl1 = delayed_R * current_gain;
 
 @gfx 640 480
-// Простой графический интерфейс
+// Simple graphical interface
 gfx_clear = 0x000000;
 
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
@@ -219,36 +206,36 @@ gfx_printf("Target: %.1f dB", target_output);
 gfx_x = 10; gfx_y = 120;
 gfx_printf("Range: %.1f to %.1f dB", range_min, range_max);
 
-// Подписи к индикаторам
+// Labels for indicators
 gfx_x = 10; gfx_y = 135;
 gfx_printf("Input Level:");
 gfx_x = 10; gfx_y = 155;
 gfx_printf("Processed Level:");
 
-// Индикатор входного уровня
+// Input level indicator
 gfx_r = 0; gfx_g = 1; gfx_b = 0;
 level_bar_width = (current_level + 60) / 60 * 200;
 level_bar_width = max(0, min(200, level_bar_width));
 gfx_rect(10, 150, level_bar_width, 15);
 
-// Индикатор обработанного уровня
+// Processed level indicator
 gfx_r = 0; gfx_g = 0.8; gfx_b = 1;
 processed_bar_width = (processed_level + 60) / 60 * 200;
 processed_bar_width = max(0, min(200, processed_bar_width));
 gfx_rect(10, 170, processed_bar_width, 15);
 
-// Рамки индикаторов
+// Indicator frames
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
 gfx_rect(10, 150, 200, 15, 0);
 gfx_rect(10, 170, 200, 15, 0);
 
-// Целевая отметка
+// Target mark
 target_pos = (target_output + 60) / 60 * 200;
 target_pos = max(0, min(200, target_pos));
 gfx_r = 1; gfx_g = 0; gfx_b = 0;
 gfx_line(10 + target_pos, 145, 10 + target_pos, 190);
 
-// Отметки Range Min/Max
+// Range Min/Max marks
 range_min_pos = (range_min + 60) / 60 * 200;
 range_max_pos = (range_max + 60) / 60 * 200;
 range_min_pos = max(0, min(200, range_min_pos));
