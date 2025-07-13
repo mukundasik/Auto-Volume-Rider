@@ -82,42 +82,48 @@ lufs_buffer = 0;
 lookahead_buffer = 0;
 oversample_buffer = 0;
 
-// Функция для вычисления коэффициентов атаки и релиза
-function calculate_time_coefficients()
+@slider
+// Обновление коэффициентов
+smoothing_factor = slider4;
+attack_coeff = exp(-1 / (slider13 * srate));
+release_coeff = exp(-1 / (slider14 * srate));
+
+@sample
+// Основная обработка
+spl0 = spl0 * 10^(slider5 / 20); // Input Gain
+spl1 = spl1 * 10^(slider5 / 20);
+
+// Lookahead processing
+if (slider12 > 0.5)
 (
-  attack_coeff = exp(-1 / (slider13 * srate));
-  release_coeff = exp(-1 / (slider14 * srate));
+  // Простая реализация lookahead
+  lookahead_delay = lookahead_buffer_size / 2;
+  delayed_idx = (lookahead_idx - lookahead_delay + lookahead_buffer_size) % lookahead_buffer_size;
+  
+  spl0 = lookahead_buffer[delayed_idx];
+  spl1 = lookahead_buffer[delayed_idx];
 );
 
-// Функция для обновления скользящего среднего
-function update_moving_average(current_value, old_avg)
-(
-  new_avg = old_avg * (1 - smoothing_factor) + current_value * smoothing_factor;
-  new_avg;
-);
+// Обновление буферов анализа
+// Peak buffer
+peak_buffer[peak_idx] = abs(spl0);
+peak_idx = (peak_idx + 1) % peak_buffer_size;
 
-// Функция для обновления буферов
-function update_buffers(input)
-(
-  // Обновление peak buffer
-  peak_buffer[peak_idx] = abs(input);
-  peak_idx = (peak_idx + 1) % peak_buffer_size;
-  
-  // Обновление RMS buffer
-  rms_buffer[rms_idx] = input * input;
-  rms_idx = (rms_idx + 1) % rms_buffer_size;
-  
-  // Обновление LUFS buffer
-  lufs_buffer[lufs_idx] = input;
-  lufs_idx = (lufs_idx + 1) % lufs_buffer_size;
-  
-  // Обновление lookahead buffer
-  lookahead_buffer[lookahead_idx] = input;
-  lookahead_idx = (lookahead_idx + 1) % lookahead_buffer_size;
-);
+// RMS buffer
+rms_buffer[rms_idx] = spl0 * spl0;
+rms_idx = (rms_idx + 1) % rms_buffer_size;
 
-// Функция для вычисления средних значений из буферов
-function calculate_averages()
+// LUFS buffer
+lufs_buffer[lufs_idx] = spl0;
+lufs_idx = (lufs_idx + 1) % lufs_buffer_size;
+
+// Lookahead buffer
+lookahead_buffer[lookahead_idx] = spl0;
+lookahead_idx = (lookahead_idx + 1) % lookahead_buffer_size;
+
+// Вычисление средних значений каждые 64 сэмпла
+lufs_sample_count += 1;
+if (lufs_sample_count >= 64)
 (
   // Peak average
   peak_sum = 0;
@@ -139,15 +145,13 @@ function calculate_averages()
   );
   current_rms = sqrt(rms_sum / rms_buffer_size);
   
-  // LUFS calculation (улучшенная версия)
+  // LUFS calculation (упрощенная версия)
   lufs_sum = 0;
   i = 0;
   while (i < lufs_buffer_size)
   (
-    // Простая реализация LUFS (в реальности нужны сложные фильтры)
     sample = lufs_buffer[i];
-    // Применение K-weighting (упрощенная версия)
-    weighted_sample = sample * 1.0; // В реальности здесь должны быть фильтры
+    weighted_sample = sample * 1.0; // Упрощенная версия K-weighting
     lufs_sum += weighted_sample * weighted_sample;
     i += 1;
   );
@@ -162,10 +166,12 @@ function calculate_averages()
     current_lufs_s = -60;
     current_lufs_m = -60;
   );
+  
+  lufs_sample_count = 0;
 );
 
-// Функция для вычисления коэффициента усиления
-function calculate_gain()
+// Вычисление коэффициента усиления AutoGain
+if (slider1 > 0.5)
 (
   // Выбор метрики в зависимости от режима анализа
   metric_value = 0;
@@ -175,10 +181,10 @@ function calculate_gain()
   else metric_value = current_lufs_m;
   
   // Обновление скользящего среднего
-  if (slider11 == 0) moving_avg_peak = update_moving_average(metric_value, moving_avg_peak);
-  else if (slider11 == 1) moving_avg_rms = update_moving_average(metric_value, moving_avg_rms);
-  else if (slider11 == 2) moving_avg_lufs_s = update_moving_average(metric_value, moving_avg_lufs_s);
-  else moving_avg_lufs_m = update_moving_average(metric_value, moving_avg_lufs_m);
+  if (slider11 == 0) moving_avg_peak = moving_avg_peak * (1 - smoothing_factor) + metric_value * smoothing_factor;
+  else if (slider11 == 1) moving_avg_rms = moving_avg_rms * (1 - smoothing_factor) + metric_value * smoothing_factor;
+  else if (slider11 == 2) moving_avg_lufs_s = moving_avg_lufs_s * (1 - smoothing_factor) + metric_value * smoothing_factor;
+  else moving_avg_lufs_m = moving_avg_lufs_m * (1 - smoothing_factor) + metric_value * smoothing_factor;
   
   // Выбор текущего скользящего среднего
   current_moving_avg = 0;
@@ -208,49 +214,34 @@ function calculate_gain()
     gain_smoother = gain_smoother * release_coeff + 10^(gain_db / 20) * (1 - release_coeff);
   );
   
-  gain_smoother;
+  gain_coeff = gain_smoother;
+  spl0 = spl0 * gain_coeff;
+  spl1 = spl1 * gain_coeff;
 );
 
-// Функция для True Peak detection
-function true_peak_detect(input)
+// Применение лимитера
+if (slider7 > 0.5)
 (
-  // Простая реализация True Peak через oversampling
-  peak_value = abs(input);
+  // True Peak detection
+  peak_value = abs(spl0);
   
-  // Oversampling для более точного определения пиков
   if (slider9 > 0.5)
   (
-    // Простая интерполяция
+    // Простая интерполяция для True Peak
     prev_sample = oversample_buffer[(oversample_idx - 1 + oversample_factor) % oversample_factor];
     next_sample = oversample_buffer[(oversample_idx + 1) % oversample_factor];
     
-    // Поиск максимального значения между сэмплами
     interp_peak = max(peak_value, abs(prev_sample), abs(next_sample));
     peak_value = interp_peak;
   );
   
   // Обновление oversample buffer
-  oversample_buffer[oversample_idx] = input;
+  oversample_buffer[oversample_idx] = spl0;
   oversample_idx = (oversample_idx + 1) % oversample_factor;
   
-  peak_value;
-);
-
-// Функция для лимитера
-function limiter_process(input, channel)
-(
-  // True Peak detection
-  peak_value = true_peak_detect(input);
-  
   // Обновление True Peak для каналов
-  if (channel == 0)
-  (
-    true_peak_left = max(true_peak_left, peak_value);
-  )
-  else
-  (
-    true_peak_right = max(true_peak_right, peak_value);
-  );
+  true_peak_left = max(true_peak_left, peak_value);
+  true_peak_right = max(true_peak_right, peak_value);
   
   // Вычисление коэффициента лимитера
   threshold_linear = 10^(slider8 / 20);
@@ -270,55 +261,8 @@ function limiter_process(input, channel)
   // Ограничение минимального значения
   if (limiter_gain < 0.001) limiter_gain = 0.001;
   
-  input * limiter_gain;
-);
-
-@slider
-// Обновление коэффициентов
-smoothing_factor = slider4;
-calculate_time_coefficients();
-
-@sample
-// Основная обработка
-spl0 = spl0 * 10^(slider5 / 20); // Input Gain
-spl1 = spl1 * 10^(slider5 / 20);
-
-// Lookahead processing
-if (slider12 > 0.5)
-(
-  // Простая реализация lookahead
-  lookahead_delay = lookahead_buffer_size / 2;
-  delayed_idx = (lookahead_idx - lookahead_delay + lookahead_buffer_size) % lookahead_buffer_size;
-  
-  spl0 = lookahead_buffer[delayed_idx];
-  spl1 = lookahead_buffer[delayed_idx];
-);
-
-// Обновление буферов анализа
-update_buffers(spl0);
-update_buffers(spl1);
-
-// Вычисление средних значений каждые 64 сэмпла
-lufs_sample_count += 1;
-if (lufs_sample_count >= 64)
-(
-  calculate_averages();
-  lufs_sample_count = 0;
-);
-
-// Вычисление коэффициента усиления AutoGain
-if (slider1 > 0.5)
-(
-  gain_coeff = calculate_gain();
-  spl0 = spl0 * gain_coeff;
-  spl1 = spl1 * gain_coeff;
-);
-
-// Применение лимитера
-if (slider7 > 0.5)
-(
-  spl0 = limiter_process(spl0, 0);
-  spl1 = limiter_process(spl1, 1);
+  spl0 = spl0 * limiter_gain;
+  spl1 = spl1 * limiter_gain;
 );
 
 // Output Gain
@@ -380,7 +324,7 @@ gfx_drawstr("Target: " + sprintf("%.1f", slider2) + " to " + sprintf("%.1f", sli
 // Отображение коэффициента усиления
 gfx_x = 10;
 gfx_y = 195;
-gain_db = 20 * log10(calculate_gain());
+gain_db = 20 * log10(gain_smoother);
 gfx_drawstr("Gain: " + sprintf("%.1f", gain_db) + " dB");
 
 // Отображение статуса лимитера
