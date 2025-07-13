@@ -6,8 +6,8 @@ changelog:Initial release
 slider1:0<-24,24,0.1>Input Gain (dB)
 slider2:0<0,3,1{Peak,LUFS Short,LUFS Momentary,RMS}>Mode
 slider3:0.1<0,5,0.01>Lookahead (sec)
-slider4:50<0.1,1000,0.1>Attack (ms)
-slider5:500<1,5000,1>Release (ms)
+slider4:20<0.1,1000,0.1>Attack (ms)
+slider5:200<1,5000,1>Release (ms)
 slider6:-30<-60,0,0.1>Target Range Min (dB)
 slider7:-10<-60,0,0.1>Target Range Max (dB)
 slider8:0<-24,24,0.1>Output Gain (dB)
@@ -57,7 +57,7 @@ lufs_long_sum_R = 0;
 // Gain smoothing
 current_gain = 1.0;
 target_gain = 1.0;
-startup_counter = 2 * srate; // 2 seconds of gentle startup
+startup_counter = 0.5 * srate; // 0.5 seconds of gentle startup
 
 // Attack/Release parameters
 attack_coeff = 0.999;
@@ -120,19 +120,19 @@ min_changed && !max_changed && target_range_min > target_range_max ? (
   target_range_max = target_range_min;
   slider7 = target_range_max;
   sliderchange(slider7);
-  startup_counter = max(startup_counter, 0.5 * srate);
+  startup_counter = max(startup_counter, 0.2 * srate);
 ) : max_changed && !min_changed && target_range_max < target_range_min ? (
   // Max slider moved down past min - move min down with it  
   target_range_min = target_range_max;
   slider6 = target_range_min;
   sliderchange(slider6);
-  startup_counter = max(startup_counter, 0.5 * srate);
+  startup_counter = max(startup_counter, 0.2 * srate);
 ) : target_range_min > target_range_max ? (
   // Fallback - if both changed or other edge case
   target_range_min = target_range_max;
   slider6 = target_range_min;
   sliderchange(slider6);
-  startup_counter = max(startup_counter, 0.5 * srate);
+  startup_counter = max(startup_counter, 0.2 * srate);
 );
 
 // Store current values for next comparison
@@ -227,17 +227,7 @@ write_pos = (write_pos + 1) % max_lookahead_samples;
 // Measure current signal level
 current_level = 0;
 
-// Handle startup and mode switching stability  
-startup_counter > 0 ? (
-  startup_counter -= 1;
-  // Gentle startup - keep unity gain for first 2 seconds
-  target_gain = 1.0;
-) : mode_change_counter > 0 ? (
-  mode_change_counter -= 1;
-  // Keep previous gain during stabilization
-  target_gain = current_gain;
-) : (
-  
+// Always calculate the level and desired gain first
 mode == 0 ? (
   // Peak mode - improved implementation
   peak_L = abs(spl0);
@@ -299,12 +289,25 @@ target_center = (target_range_min + target_range_max) / 2;
 
 // Calculate required gain to bring current level to target center
 level_diff = target_center - current_level;
-target_gain = 10^(level_diff/20);
+desired_gain = 10^(level_diff/20);
 
 // Limit gain to safe bounds to prevent clipping
-target_gain = max(0.1, min(10, target_gain));
+desired_gain = max(0.1, min(10, desired_gain));
 
-); // Close mode stabilization bracket
+// Handle startup and mode switching stability  
+startup_counter > 0 ? (
+  startup_counter -= 1;
+  // Gentle startup - gradually transition from unity gain
+  startup_progress = 1.0 - (startup_counter / (0.5 * srate));
+  target_gain = desired_gain * startup_progress + 1.0 * (1.0 - startup_progress);
+) : mode_change_counter > 0 ? (
+  mode_change_counter -= 1;
+  // Keep previous gain during stabilization
+  target_gain = current_gain;
+) : (
+  // Normal operation
+  target_gain = desired_gain;
+);
 
 // Apply Attack/Release for smoothing
 target_gain > current_gain ? (
@@ -384,12 +387,23 @@ spl1 = processed_R;
 // Clear background
 gfx_clear = 0x202020;
 
+// Display text info first
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_x = 10; gfx_y = 20;
+gfx_printf("Target Range: %.1f to %.1f dB", target_range_min, target_range_max);
+
+gfx_x = 10; gfx_y = 40;
+gfx_printf("Target Center: %.1f dB", target_center);
+
+gfx_x = 10; gfx_y = 60;
+gfx_printf("Output Level: %.1f dB", processed_level_display);
+
 // Vertical meters - properly centered in 640px window
 // Window width = 640, center = 320
 // Meter setup: Input(white) - space - Output(green) - space - GR(red)
 meter_width = 20;
-meter_height = 350;
-meter_y = 60;
+meter_height = 320;
+meter_y = 90;
 
 // Input meter (white) - left of center  
 meter_x = 260;
@@ -422,7 +436,7 @@ function db_to_pixel(db_val) (
 
 input_fill_height = db_to_pixel(input_level_db);
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
-gfx_rect(meter_x + 1, meter_y + 1, meter_width - 2, input_fill_height);
+gfx_rect(meter_x + 1, meter_y + meter_height - input_fill_height, meter_width - 2, input_fill_height);
 
 // Label
 gfx_x = meter_x + 5; gfx_y = meter_y + meter_height + 10;
@@ -435,7 +449,7 @@ gfx_rect(proc_meter_x, meter_y, meter_width, meter_height, 0); // Frame
 // Fill based on level
 processed_fill_height = db_to_pixel(processed_level_db);
 gfx_r = 0; gfx_g = 1; gfx_b = 0;
-gfx_rect(proc_meter_x + 1, meter_y + 1, meter_width - 2, processed_fill_height);
+gfx_rect(proc_meter_x + 1, meter_y + meter_height - processed_fill_height, meter_width - 2, processed_fill_height);
 
 // Label
 gfx_x = proc_meter_x + 2; gfx_y = meter_y + meter_height + 10;
