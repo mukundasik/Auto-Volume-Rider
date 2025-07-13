@@ -316,17 +316,41 @@ gfx_line(meter_x - 5, target_center_pos, proc_meter_x + meter_width + 5, target_
 
 // dB Scale
 gfx_r = 0.7; gfx_g = 0.7; gfx_b = 0.7;
-db_marks = (-60, -40, -20, -10, -6, -3, 0);
-i = 0;
-loop(7,
-  db_val = db_marks[i];
-  scale_pos = meter_y + meter_height - ((db_val + 60) / 60) * meter_height;
-  scale_pos = max(meter_y, min(meter_y + meter_height, scale_pos));
-  gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
-  gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
-  gfx_printf("%.0f", db_val);
-  i += 1;
-);
+// Draw scale marks manually
+scale_pos = meter_y + meter_height - ((-60 + 60) / 60) * meter_height;
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-60");
+
+scale_pos = meter_y + meter_height - ((-40 + 60) / 60) * meter_height;
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-40");
+
+scale_pos = meter_y + meter_height - ((-20 + 60) / 60) * meter_height;
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-20");
+
+scale_pos = meter_y + meter_height - ((-10 + 60) / 60) * meter_height;
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-10");
+
+scale_pos = meter_y + meter_height - ((-6 + 60) / 60) * meter_height;
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-6");
+
+scale_pos = meter_y + meter_height - ((-3 + 60) / 60) * meter_height;
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("-3");
+
+scale_pos = meter_y + meter_height - ((0 + 60) / 60) * meter_height;
+gfx_line(meter_x - 15, scale_pos, meter_x - 5, scale_pos);
+gfx_x = meter_x - 35; gfx_y = scale_pos - 5;
+gfx_printf("0");
 
 // Numerical readouts
 gfx_r = 1; gfx_g = 1; gfx_b = 1;
